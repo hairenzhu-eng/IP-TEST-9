@@ -1,0 +1,233 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[a4paper,margin=24mm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs,longtable,array}
+\usepackage{xcolor,listings}
+\usepackage[hidelinks]{hyperref}
+\definecolor{codebg}{HTML}{F4F6F9}
+\definecolor{codeframe}{HTML}{D5DCE5}
+\lstset{language=Python,basicstyle=\ttfamily\small,backgroundcolor=\color{codebg},frame=single,rulecolor=\color{codeframe},breaklines=true,showstringspaces=false,columns=fullflexible,keepspaces=true}
+\IfFileExists{src/laptop.py}{}{\lstset{inputpath=../}}
+\setlength{\parindent}{0pt}\setlength{\parskip}{5pt}
+
+\begin{document}
+
+\section{Scope and Data Flow}
+This document contains only the dynamic-obstacle pipeline implemented in the current codebase:
+\[
+\text{LiDAR cluster}\rightarrow\text{track association}\rightarrow\text{obstacle EKF}\rightarrow\text{TCPA/DCPA}\rightarrow\text{virtual fields}\rightarrow\text{APF}.
+\]
+The vessel six-state EKF, thruster dynamics, COLREG decision details, route controller, GUI, and unrelated source files are excluded.
+
+\section{Obstacle EKF}
+
+\subsection{State and Constant-Velocity Model}
+Each obstacle track uses
+\[
+\bm{x}_k=\begin{bmatrix}p_N&p_E&v_N&v_E\end{bmatrix}^{\mathsf T},
+\]
+where \(p_N,p_E\) are North--East position components and \(v_N,v_E\) are the corresponding velocities. The transition model is
+\[
+\bm{x}_{k+1}=\bm{F}(\Delta t)\bm{x}_k,
+\qquad
+\bm{F}=\begin{bmatrix}1&0&\Delta t&0\\0&1&0&\Delta t\\0&0&1&0\\0&0&0&1\end{bmatrix}.
+\]
+Position is advanced by velocity multiplied by the time step, while velocity is copied forward.
+
+\subsection{Process Noise}
+The constant-velocity assumption is imperfect because a real obstacle may accelerate or turn. The process covariance models this uncertainty:
+\[
+\bm{Q}=q\begin{bmatrix}
+\frac{\Delta t^4}{4}&0&\frac{\Delta t^3}{2}&0\\
+0&\frac{\Delta t^4}{4}&0&\frac{\Delta t^3}{2}\\
+\frac{\Delta t^3}{2}&0&\Delta t^2&0\\
+0&\frac{\Delta t^3}{2}&0&\Delta t^2
+\end{bmatrix},\qquad q=\sigma_a^2.
+\]
+Larger \(\sigma_a\) makes the filter less confident in constant velocity and more responsive to measurements.
+
+\lstinputlisting[firstline=1353,lastline=1387]{src/laptop.py}
+
+\subsection{Prediction and Position Update}
+The prediction is
+\[
+\hat{\bm{x}}_k=\bm{F}\bm{x}_{k-1}^{+},qquad
+\hat{\bm{P}}_k=\bm{F}\bm{P}_{k-1}^{+}\bm{F}^{\mathsf T}+\bm{Q}.
+\]
+LiDAR measures position only:
+\[
+\bm{z}=\begin{bmatrix}p_N^{\mathrm{meas}}&p_E^{\mathrm{meas}}\end{bmatrix}^{\mathsf T},qquad
+\bm{H}=\begin{bmatrix}1&0&0&0\\0&1&0&0\end{bmatrix}.
+\]
+The innovation, gain, corrected state, and Joseph covariance update are
+\begin{align}
+\bm{\nu}&=\bm{z}-\bm{H}\hat{\bm{x}},\\
+\bm{S}&=\bm{H}\hat{\bm{P}}\bm{H}^{\mathsf T}+\bm{R},\\
+\bm{K}&=\hat{\bm{P}}\bm{H}^{\mathsf T}\bm{S}^{-1},\\
+\bm{x}^{+}&=\hat{\bm{x}}+\bm{K}\bm{\nu},\\
+\bm{P}^{+}&=(\bm{I}-\bm{K}\bm{H})\hat{\bm{P}}(\bm{I}-\bm{K}\bm{H})^{\mathsf T}+\bm{K}\bm{R}\bm{K}^{\mathsf T}.
+\end{align}
+The covariance expresses uncertainty: the state is the best estimate, while the covariance determines how strongly the next measurement should correct it.
+
+\lstinputlisting[firstline=1389,lastline=1459]{src/laptop.py}
+
+\subsection{Track Stability and Future Position}
+A track is not accepted as a reliable moving obstacle after a single detection. The implementation checks sample count, hit count, time span, speed, and missed detections. Stable tracks are extrapolated as
+\[
+\bm{p}(\tau)=\bm{p}_0+\bm{v}_0\tau+\frac12\bm{a}\tau^2.
+\]
+When acceleration is unavailable or too uncertain, \(\bm{a}=\bm{0}\) and the model becomes constant velocity.
+
+\lstinputlisting[firstline=1461,lastline=1534]{src/laptop.py}
+\lstinputlisting[firstline=1910,lastline=2118]{src/laptop.py}
+
+\section{TCPA and DCPA}
+
+Let own-ship position and velocity be \((\bm{p}_o,\bm{v}_o)\), and obstacle position and velocity be \((\bm{p}_t,\bm{v}_t)\). The implementation assumes that both vehicles keep their current velocities over the short prediction interval.
+
+The relative position and velocity are
+\[
+\bm{r}=\bm{p}_t-\bm{p}_o,\qquad \bm{v}_r=\bm{v}_t-\bm{v}_o.
+\]
+The squared separation at time \(t\) is
+\[
+d^2(t)=\|\bm{r}+\bm{v}_r t\|^2
+\]
+and therefore
+\[
+d^2(t)=\bm{r}^{\mathsf T}\bm{r}+2t\bm{r}^{\mathsf T}\bm{v}_r+t^2\bm{v}_r^{\mathsf T}\bm{v}_r.
+\]
+Minimising this quadratic function gives the unconstrained closest-approach time
+\[
+t^*=-\frac{\bm{r}^{\mathsf T}\bm{v}_r}{\|\bm{v}_r\|^2}.
+\]
+
+\subsection{How the Sign Determines Closing or Separating}
+The key quantity is \(\bm{r}^{\mathsf T}\bm{v}_r\):
+\begin{itemize}
+  \item If it is negative, the vehicles are closing and \(t^*>0\); the closest point is in the future.
+  \item If it is positive, the vehicles are separating and \(t^*<0\); the mathematical closest point is in the past, so the current instant is used.
+  \item If it is zero, relative motion is perpendicular to the current separation and the current instant is the closest point under the straight-line model.
+  \item If \(\|\bm{v}_r\|^2\) is nearly zero, there is no reliable relative-motion direction; the implementation avoids division by a nearly zero value.
+\end{itemize}
+
+The implementation clips the non-negative time to the configured horizon:
+\[
+t_{\mathrm{CPA}}=\min\left(\max(t^*,0),T_{\max}\right).
+\]
+Thus, if the unrestricted closest point lies beyond the horizon, the reported distance is the distance at the horizon rather than an unrestricted long-term DCPA.
+
+The CPA positions and distance are
+\[
+\bm{p}_{o,\mathrm{CPA}}=\bm{p}_o+\bm{v}_o t_{\mathrm{CPA}},
+\quad
+\bm{p}_{t,\mathrm{CPA}}=\bm{p}_t+\bm{v}_t t_{\mathrm{CPA}},
+\]
+\[
+d_{\mathrm{CPA}}=\|\bm{p}_{t,\mathrm{CPA}}-\bm{p}_{o,\mathrm{CPA}}\|.
+\]
+TCPA answers ``when will the separation be smallest?''; DCPA answers ``how large will that separation be at the reported time?''.
+
+\subsection{Numerical Examples}
+For \(\bm{r}=[10,-5]^{\mathsf T}\) and \(\bm{v}_r=[-1,1]^{\mathsf T}\), the dot product is \(-15\) and the relative-speed square is \(2\). Therefore \(t^*=7.5\,\mathrm{s}\), so a \(10\,\mathrm{s}\) horizon returns \(t_{\mathrm{CPA}}=7.5\,\mathrm{s}\).
+
+For \(\bm{r}=[10,0]^{\mathsf T}\) and \(\bm{v}_r=[1,0]^{\mathsf T}\), \(t^*=-10\,\mathrm{s}\). The code clips it to zero and reports the current separation as DCPA.
+
+\lstinputlisting[firstline=60,lastline=85]{src/colreg_apf.py}
+\lstinputlisting[firstline=2272,lastline=2278]{src/laptop.py}
+
+\section{TCPA-Gated Virtual APF Fields}
+
+Only a stable, sufficiently fast track satisfying
+\[
+0<t_{\mathrm{CPA}}\leq T_{\mathrm{horizon}}
+\]
+is converted into a virtual field. The final field centre is placed at
+\[
+\bm{p}_{\mathrm{virtual}}=\bm{p}_t+2t_{\mathrm{CPA}}\bm{v}_t.
+\]
+The factor two places the predicted field ahead of the closest-approach point and gives the planner time to react; it is an implementation rule, not a physical law.
+
+\subsection{Own-Ship Equivalent Radius}
+The obstacle is represented by an ellipse, while planning uses the own-ship reference point. The field therefore expands the obstacle semi-axes:
+\[
+a=\frac{pc1}{2}+r_{\mathrm{own}},\qquad b=\frac{pc2}{2}+r_{\mathrm{own}}.
+\]
+This approximates the own ship as a circle and inflates the obstacle footprint. Without this margin, the own-ship reference point could clear an obstacle while the physical hull still intersects it.
+
+\subsection{Bridge Fields}
+Intermediate ellipses are inserted between the current predicted position and the final \(2t_{\mathrm{CPA}}\) position. Their spacing is based on the combined support radius, producing a continuous predicted exclusion corridor instead of isolated future points.
+
+\lstinputlisting[firstline=3745,lastline=3821]{src/laptop.py}
+
+\section{APF Generation}
+
+\subsection{Ellipse Geometry and Repulsion}
+For obstacle centre \(\bm{c}\), length axis \(\hat{\bm{l}}\), width axis \(\hat{\bm{w}}\), and grid point \(\bm{p}\), define
+\[
+\ell=(\bm{p}-\bm{c})\cdot\hat{\bm{l}},\qquad
+w=(\bm{p}-\bm{c})\cdot\hat{\bm{w}},
+\]
+\[
+\rho=\sqrt{\left(\frac{\ell}{a}\right)^2+\left(\frac{w}{b}\right)^2}.
+\]
+The real-time field is active inside its outer scale \(s\). Between \(\rho=1\) and \(\rho=s\), the cubic fade is
+\[
+u=\operatorname{clip}\left(\frac{\rho-1}{s-1},0,1\right),qquad
+f_{\mathrm{fade}}=1-(3u^2-2u^3),
+\]
+and
+\[
+\bm{F}_{\mathrm{rep}}=k_{\mathrm{rep}}f_{\mathrm{fade}}\hat{\bm{d}},
+\]
+where \(\hat{\bm{d}}\) points away from the obstacle.
+
+\lstinputlisting[firstline=3618,lastline=3647]{src/laptop.py}
+\lstinputlisting[firstline=200,lastline=208]{src/colreg_apf.py}
+\lstinputlisting[firstline=3649,lastline=3711]{src/laptop.py}
+
+\subsection{Attraction, Current Fields, and Virtual Fields}
+The snapshot APF is the sum of goal attraction, current-obstacle fields, and risk-active virtual fields:
+\[
+U(\bm{p})=U_{\mathrm{goal}}(\bm{p})+
+\sum_iU_{\mathrm{current},i}(\bm{p})+
+\sum_jU_{\mathrm{virtual},j}(\bm{p}).
+\]
+The goal potential is
+\[
+U_{\mathrm{goal}}(\bm{p})=\frac12k_g\|\bm{p}-\bm{p}_{\mathrm{goal}}\|^2.
+\]
+The real-time controller uses vector repulsion; the snapshot renderer uses scalar grid potentials. Both use the same obstacle centres, dimensions, axes, and virtual-field records.
+
+\lstinputlisting[firstline=770,lastline=841]{src/plot_apf_snapshots.py}
+\lstinputlisting[firstline=897,lastline=950]{src/plot_apf_snapshots.py}
+
+\section{Minimal Code Map and Verification}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.30\textwidth}p{0.56\textwidth}}
+\toprule
+\textbf{Stage} & \textbf{Current implementation} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Stage} & \textbf{Current implementation} \\
+\midrule
+\endhead
+EKF prediction & \texttt{obstacle\_ekf\_predict} \\
+Process noise & \texttt{obstacle\_ekf\_process\_noise} \\
+Measurement update & \texttt{obstacle\_ekf\_update} \\
+Stability and extrapolation & \texttt{obstacle\_track\_motion\_is\_stable}, \texttt{obstacle\_track\_state\_at} \\
+Track association & \texttt{update\_apf\_obstacle\_tracks} \\
+TCPA/DCPA & \texttt{straight\_line\_cpa}, \texttt{apf\_cpa\_metrics} \\
+Virtual fields & \texttt{update\_apf\_virtual\_obstacles} \\
+Real-time APF & \texttt{apf\_repulsion\_for\_obstacle} \\
+Snapshot APF & \texttt{potential\_components} \\
+\bottomrule
+\end{longtable}
+
+The focused regression checks are in \texttt{src/test\_colreg\_geometry.py}:
+\begin{lstlisting}[language=bash]
+cd src
+python -m pytest test_colreg_geometry.py -q
+\end{lstlisting}
+
+\end{document}

@@ -1,0 +1,27 @@
+\contentsline {section}{Abbreviations and full forms}{3}{section*.2}%
+\contentsline {section}{\numberline {1}Six-state vessel EKF}{3}{section.1}%
+\contentsline {subsection}{\numberline {1.1}State vector and motion model}{3}{subsection.1.1}%
+\contentsline {subsection}{\numberline {1.2}State-transition Jacobian}{4}{subsection.1.2}%
+\contentsline {subsection}{\numberline {1.3}Prediction step}{5}{subsection.1.3}%
+\contentsline {subsection}{\numberline {1.4}Pose and yaw-rate measurement models}{5}{subsection.1.4}%
+\contentsline {subsection}{\numberline {1.5}Measurement update}{6}{subsection.1.5}%
+\contentsline {section}{\numberline {2}Five-state obstacle CTRV-EKF}{6}{section.2}%
+\contentsline {subsection}{\numberline {2.1}State vector}{7}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}CTRV prediction}{7}{subsection.2.2}%
+\contentsline {subsection}{\numberline {2.3}Numerical Jacobian}{7}{subsection.2.3}%
+\contentsline {subsection}{\numberline {2.4}Process noise}{8}{subsection.2.4}%
+\contentsline {subsection}{\numberline {2.5}Position measurement update}{8}{subsection.2.5}%
+\contentsline {subsection}{\numberline {2.6}Future position and trajectory}{9}{subsection.2.6}%
+\contentsline {section}{\numberline {3}APF obstacle geometry}{9}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Elliptical level set}{9}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Smooth elliptical repulsion}{10}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Observed dimensions in snapshot generation}{10}{subsection.3.3}%
+\contentsline {section}{\numberline {4}APF attractive terms}{11}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Goal attraction}{11}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Path attraction}{11}{subsection.4.2}%
+\contentsline {section}{\numberline {5}CPA-based dynamic-obstacle risk}{12}{section.5}%
+\contentsline {section}{\numberline {6}APF force composition and control output}{13}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Total force}{13}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}Force direction and yaw-rate command}{14}{subsection.6.2}%
+\contentsline {section}{\numberline {7}Processing chain}{14}{section.7}%
+\contentsline {section}{\numberline {8}Implementation index}{15}{section.8}%

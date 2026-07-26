@@ -1,0 +1,236 @@
+\documentclass[UTF8,11pt,a4paper]{ctexart}
+
+\usepackage[a4paper,margin=24mm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs,longtable,array}
+\usepackage{xcolor,listings}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{codebg}{HTML}{F4F6F9}
+\definecolor{codeframe}{HTML}{D5DCE5}
+\lstset{language=Python,basicstyle=\ttfamily\small,backgroundcolor=\color{codebg},frame=single,rulecolor=\color{codeframe},breaklines=true,showstringspaces=false,columns=fullflexible,keepspaces=true}
+\IfFileExists{src/laptop.py}{}{\lstset{inputpath=../}}
+\setlength{\parindent}{0pt}\setlength{\parskip}{5pt}
+
+\begin{document}
+
+\section{文档范围与数据流}
+本文只保留当前代码中的动态障碍物主流程：
+\[
+\text{LiDAR 聚类}\rightarrow\text{轨迹关联}\rightarrow\text{障碍物 EKF}\rightarrow\text{TCPA/DCPA}\rightarrow\text{虚拟势场}\rightarrow\text{APF}。
+\]
+船舶六状态 EKF、推进器动力学、COLREG 决策细节、航迹控制器、GUI 和无关源文件均不包含在本文中。
+
+\section{障碍物 EKF}
+
+\subsection{状态与常速度模型}
+每条障碍物轨迹使用四维状态：
+\[
+\bm{x}_k=\begin{bmatrix}p_N&p_E&v_N&v_E\end{bmatrix}^{\mathsf T}，
+\]
+其中 \(p_N,p_E\) 是 North--East 坐标中的位置，\(v_N,v_E\) 是对应速度。状态转移矩阵为：
+\[
+\bm{x}_{k+1}=\bm{F}(\Delta t)\bm{x}_k,
+\qquad
+\bm{F}=\begin{bmatrix}1&0&\Delta t&0\\0&1&0&\Delta t\\0&0&1&0\\0&0&0&1\end{bmatrix}。
+\]
+含义是：新位置等于旧位置加速度乘时间，速度在一步预测中保持不变。
+
+\subsection{过程噪声}
+真实障碍物可能加速或转向，因此常速度模型需要过程噪声表示这种不确定性：
+\[
+\bm{Q}=q\begin{bmatrix}
+\frac{\Delta t^4}{4}&0&\frac{\Delta t^3}{2}&0\\
+0&\frac{\Delta t^4}{4}&0&\frac{\Delta t^3}{2}\\
+\frac{\Delta t^3}{2}&0&\Delta t^2&0\\
+0&\frac{\Delta t^3}{2}&0&\Delta t^2
+\end{bmatrix},\qquad q=\sigma_a^2。
+\]
+\(\sigma_a\) 越大，表示越不相信常速度假设，也越容易跟随新观测。
+
+\lstinputlisting[firstline=1353,lastline=1387]{src/laptop.py}
+
+\subsection{预测与位置校正}
+预测步骤为：
+\[
+\hat{\bm{x}}_k=\bm{F}\bm{x}_{k-1}^{+},qquad
+\hat{\bm{P}}_k=\bm{F}\bm{P}_{k-1}^{+}\bm{F}^{\mathsf T}+\bm{Q}。
+\]
+LiDAR 只测量位置：
+\[
+\bm{z}=\begin{bmatrix}p_N^{\mathrm{meas}}&p_E^{\mathrm{meas}}\end{bmatrix}^{\mathsf T},qquad
+\bm{H}=\begin{bmatrix}1&0&0&0\\0&1&0&0\end{bmatrix}。
+\]
+创新量、卡尔曼增益、校正状态和 Joseph 协方差更新为：
+\begin{align}
+\bm{\nu}&=\bm{z}-\bm{H}\hat{\bm{x}},\\
+\bm{S}&=\bm{H}\hat{\bm{P}}\bm{H}^{\mathsf T}+\bm{R},\\
+\bm{K}&=\hat{\bm{P}}\bm{H}^{\mathsf T}\bm{S}^{-1},\\
+\bm{x}^{+}&=\hat{\bm{x}}+\bm{K}\bm{\nu},\\
+\bm{P}^{+}&=(\bm{I}-\bm{K}\bm{H})\hat{\bm{P}}(\bm{I}-\bm{K}\bm{H})^{\mathsf T}+\bm{K}\bm{R}\bm{K}^{\mathsf T}。
+\end{align}
+状态是对障碍物位置和速度的最佳估计，协方差表示该估计的不确定程度，并决定下一次观测的校正力度。
+
+\lstinputlisting[firstline=1389,lastline=1459]{src/laptop.py}
+
+\subsection{轨迹稳定性与未来位置}
+单次检测不会立即成为可靠动态障碍物。代码会检查样本数、命中次数、时间跨度、速度和漏检次数。稳定轨迹的未来位置为：
+\[
+\bm{p}(\tau)=\bm{p}_0+\bm{v}_0\tau+\frac12\bm{a}\tau^2。
+\]
+当加速度不可用或不确定度过大时，令 \(\bm{a}=\bm{0}\)，退化为常速度外推。
+
+\lstinputlisting[firstline=1461,lastline=1534]{src/laptop.py}
+\lstinputlisting[firstline=1910,lastline=2118]{src/laptop.py}
+
+\section{TCPA 与 DCPA}
+
+设自船位置和速度为 \((\bm{p}_o,\bm{v}_o)\)，障碍物位置和速度为 \((\bm{p}_t,\bm{v}_t)\)。代码假设在短时间预测窗内双方保持当前速度直线运动。
+
+相对位置和相对速度为：
+\[
+\bm{r}=\bm{p}_t-\bm{p}_o,\qquad \bm{v}_r=\bm{v}_t-\bm{v}_o。
+\]
+在未来时刻 \(t\)，双方距离的平方为：
+\[
+d^2(t)=\|\bm{r}+\bm{v}_r t\|^2。
+\]
+展开后得到：
+\[
+d^2(t)=\bm{r}^{\mathsf T}\bm{r}+2t\bm{r}^{\mathsf T}\bm{v}_r+t^2\bm{v}_r^{\mathsf T}\bm{v}_r。
+\]
+对这个关于时间的二次函数求最小值，得到理论最近会遇时间：
+\[
+t^*=-\frac{\bm{r}^{\mathsf T}\bm{v}_r}{\|\bm{v}_r\|^2}。
+\]
+\subsection{通过点积正负判断接近或远离}
+关键量是 \(\bm{r}^{\mathsf T}\bm{v}_r\)：
+\begin{itemize}
+  \item 小于零：双方正在接近，\(t^*>0\)，最近点在未来。
+  \item 大于零：双方正在远离，\(t^*<0\)，最近点已经在过去，因此当前时刻是相关最近点。
+  \item 等于零：相对运动方向与当前位置方向垂直，直线模型下当前时刻已经是最近点。
+  \item 若 \(\|\bm{v}_r\|^2\) 接近零，双方几乎没有相对运动方向，代码避免除以接近零的数。
+\end{itemize}
+
+代码将非负时间限制在配置的预测时间窗内：
+\[
+t_{\mathrm{CPA}}=\min\left(\max(t^*,0),T_{\max}\right)。
+\]
+如果理论最近点超过预测时间窗，返回的距离是时间窗末端的距离，而不是无限时间下的长期 DCPA。
+
+最近会遇点的双方位置和距离为：
+\[
+\bm{p}_{o,\mathrm{CPA}}=\bm{p}_o+\bm{v}_o t_{\mathrm{CPA}},
+\quad
+\bm{p}_{t,\mathrm{CPA}}=\bm{p}_t+\bm{v}_t t_{\mathrm{CPA}},
+\]
+\[
+d_{\mathrm{CPA}}=\|\bm{p}_{t,\mathrm{CPA}}-\bm{p}_{o,\mathrm{CPA}}\|。
+\]
+TCPA 回答“什么时候距离最小”，DCPA 回答“代码报告的那个时刻距离是多少”。
+
+\subsection{数值例子}
+接近例子：设 \(\bm{r}=[10,-5]^{\mathsf T}\)，\(\bm{v}_r=[-1,1]^{\mathsf T}\)。点积为 \(-15\)，相对速度平方为 \(2\)，因此 \(t^*=7.5\,\mathrm{s}\)。如果预测时间窗为 \(10\,\mathrm{s}\)，代码得到 \(t_{\mathrm{CPA}}=7.5\,\mathrm{s}\)。
+
+远离例子：设 \(\bm{r}=[10,0]^{\mathsf T}\)，\(\bm{v}_r=[1,0]^{\mathsf T}\)。此时 \(t^*=-10\,\mathrm{s}\)，代码将其截断为零，并把当前距离作为 DCPA。
+
+\lstinputlisting[firstline=60,lastline=85]{src/colreg_apf.py}
+\lstinputlisting[firstline=2272,lastline=2278]{src/laptop.py}
+
+\section{TCPA 门控的虚拟 APF 场}
+
+只有稳定、速度达到动态阈值且满足
+\[
+0<t_{\mathrm{CPA}}\leq T_{\mathrm{horizon}}
+\]
+的轨迹才会生成虚拟场。最终虚拟场中心位于：
+\[
+\bm{p}_{\mathrm{virtual}}=\bm{p}_t+2t_{\mathrm{CPA}}\bm{v}_t。
+\]
+两倍 TCPA 使预测排斥场提前出现在最近会遇点之前，为规划器留下转向时间。这是代码中的实现规则，不是物理定律。
+
+\subsection{自船等效半径}
+障碍物用椭圆表示，而规划器使用自船参考点。因此场半轴要加入自船等效半径：
+\[
+a=\frac{pc1}{2}+r_{\mathrm{own}},\qquad b=\frac{pc2}{2}+r_{\mathrm{own}}。
+\]
+这相当于把自船近似为圆形，对障碍物边界进行膨胀。如果不加入该半径，虽然自船参考点避开了障碍物，船体外轮廓仍可能碰撞。
+
+\subsection{桥接场}
+代码在当前预测位置和最终 \(2t_{\mathrm{CPA}}\) 位置之间插入中间椭圆。间距根据相邻场的联合支撑半径确定，使离散的未来位置变成连续排斥走廊。
+
+\lstinputlisting[firstline=3745,lastline=3821]{src/laptop.py}
+
+\section{APF 生成}
+
+\subsection{椭圆几何与排斥力}
+设障碍物中心为 \(\bm{c}\)，长度方向和宽度方向单位向量分别为 \(\hat{\bm{l}},\hat{\bm{w}}\)，网格点为 \(\bm{p}\)：
+\[
+\ell=(\bm{p}-\bm{c})\cdot\hat{\bm{l}},\qquad
+w=(\bm{p}-\bm{c})\cdot\hat{\bm{w}},
+\]
+\[
+\rho=\sqrt{\left(\frac{\ell}{a}\right)^2+\left(\frac{w}{b}\right)^2}。
+\]
+\(\rho<1\) 表示点位于安全椭圆内部，外层尺度决定排斥作用何处衰减为零。
+
+在 \(\rho=1\) 和 \(\rho=s\) 之间，代码使用三次平滑衰减：
+\[
+u=\operatorname{clip}\left(\frac{\rho-1}{s-1},0,1\right),qquad
+f_{\mathrm{fade}}=1-(3u^2-2u^3)，
+\]
+排斥力为：
+\[
+\bm{F}_{\mathrm{rep}}=k_{\mathrm{rep}}f_{\mathrm{fade}}\hat{\bm{d}}，
+\]
+其中 \(\hat{\bm{d}}\) 指向远离障碍物的方向。
+
+\lstinputlisting[firstline=3618,lastline=3647]{src/laptop.py}
+\lstinputlisting[firstline=200,lastline=208]{src/colreg_apf.py}
+\lstinputlisting[firstline=3649,lastline=3711]{src/laptop.py}
+
+\subsection{吸引势、当前场与虚拟场}
+快照 APF 由目标吸引势、当前障碍物势和风险有效虚拟场势组成：
+\[
+U(\bm{p})=U_{\mathrm{goal}}(\bm{p})+
+\sum_iU_{\mathrm{current},i}(\bm{p})+
+\sum_jU_{\mathrm{virtual},j}(\bm{p})。
+\]
+目标吸引势为：
+\[
+U_{\mathrm{goal}}(\bm{p})=\frac12k_g\|\bm{p}-\bm{p}_{\mathrm{goal}}\|^2。
+\]
+实时控制器使用向量排斥力，快照绘图器使用标量网格势值；两者使用相同的障碍物中心、尺寸、轴向和虚拟场记录。
+
+\lstinputlisting[firstline=770,lastline=841]{src/plot_apf_snapshots.py}
+\lstinputlisting[firstline=897,lastline=950]{src/plot_apf_snapshots.py}
+
+\section{最小代码映射与验证}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.30\textwidth}p{0.56\textwidth}}
+\toprule
+\textbf{阶段} & \textbf{当前实现} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{阶段} & \textbf{当前实现} \\
+\midrule
+\endhead
+EKF 预测 & \texttt{obstacle\_ekf\_predict} \\
+过程噪声 & \texttt{obstacle\_ekf\_process\_noise} \\
+观测校正 & \texttt{obstacle\_ekf\_update} \\
+稳定性与外推 & \texttt{obstacle\_track\_motion\_is\_stable}, \texttt{obstacle\_track\_state\_at} \\
+轨迹关联 & \texttt{update\_apf\_obstacle\_tracks} \\
+TCPA/DCPA & \texttt{straight\_line\_cpa}, \texttt{apf\_cpa\_metrics} \\
+虚拟场 & \texttt{update\_apf\_virtual\_obstacles} \\
+实时 APF & \texttt{apf\_repulsion\_for\_obstacle} \\
+快照 APF & \texttt{potential\_components} \\
+\bottomrule
+\end{longtable}
+
+最小相关回归测试位于 \texttt{src/test\_colreg\_geometry.py}：
+\begin{lstlisting}[language=bash]
+cd src
+python -m pytest test_colreg_geometry.py -q
+\end{lstlisting}
+
+\end{document}

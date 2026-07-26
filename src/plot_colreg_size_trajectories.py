@@ -21,6 +21,11 @@ from matplotlib import pyplot as plt
 import numpy as np
 
 from plot_log_sources import list_resolved_run_dirs, resolve_run_dir
+from plot_apf_snapshots import (
+    OWN_EAST_COLUMNS,
+    OWN_NORTH_COLUMNS,
+    read_trajectory_samples_csv,
+)
 from webots_collision import collision_detected, collision_outcome_text
 
 
@@ -29,11 +34,6 @@ DEFAULT_LOGS_DIR = PROJECT_ROOT / "logs"
 DEFAULT_OUTPUT_DIR = DEFAULT_LOGS_DIR / "generated_figures" / "colreg_size_trajectories"
 DEFAULT_LATEST_LIMIT = 0
 
-TIME_COLUMNS = ("TimeFromStart(s)", "TimeFromStart", "elapsed [s]")
-OWN_NORTH_COLUMNS = ("North(m)", "North", "x [m]")
-OWN_EAST_COLUMNS = ("East(m)", "East", "y [m]")
-ARUCO_NORTH_COLUMNS = ("ARUCOSensedNorth(m)", "ARUCOSensedNorth")
-ARUCO_EAST_COLUMNS = ("ARUCOSensedEast(m)", "ARUCOSensedEast")
 SWITCH_FLAGS = {
     "ekf_on_cluster_on": (True, True),
     "ekf_on_cluster_off": (True, False),
@@ -86,13 +86,6 @@ def parse_float(value):
 def positive_float(value):
     value = parse_float(value)
     return value if np.isfinite(value) and value > 0.0 else np.nan
-
-
-def first_existing(row, names):
-    for name in names:
-        if name in row:
-            return row[name]
-    return None
 
 
 def parse_bool(value):
@@ -270,74 +263,11 @@ def find_primary_csv(run_dir):
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-def find_pseudo_aruco_csv(run_dir):
-    candidates = list(run_dir.glob("log_*_pseudo_aruco.csv"))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
-
-
-def read_trajectory_csv(log_path, north_columns, east_columns):
-    times = []
-    points = []
-    first_time_s = np.nan
-
-    with log_path.open(newline="", encoding="utf-8-sig") as stream:
-        reader = csv.DictReader(stream)
-        if reader.fieldnames is None:
-            raise ValueError(f"{log_path} has no CSV header")
-
-        for row in reader:
-            time_s = parse_float(first_existing(row, TIME_COLUMNS))
-            north_m = parse_float(first_existing(row, north_columns))
-            east_m = parse_float(first_existing(row, east_columns))
-            if not (
-                np.isfinite(time_s)
-                and np.isfinite(north_m)
-                and np.isfinite(east_m)
-            ):
-                continue
-            if not np.isfinite(first_time_s):
-                first_time_s = float(time_s)
-            times.append(float(time_s))
-            points.append([north_m, east_m])
-
-    if not times:
-        raise ValueError(f"No valid trajectory samples in {log_path}")
-
-    time_array = np.asarray(times, dtype=float)
-    trajectory_ne_m = np.asarray(points, dtype=float)
-    order = np.argsort(time_array)
-    time_array = time_array[order]
-    trajectory_ne_m = trajectory_ne_m[order]
-    time_array -= float(first_time_s) if np.isfinite(first_time_s) else time_array[0]
-    return time_array, trajectory_ne_m
-
-
 def read_trajectory(log_path, run_dir):
-    pseudo_aruco_path = find_pseudo_aruco_csv(run_dir)
-    if pseudo_aruco_path is not None:
-        try:
-            return read_trajectory_csv(
-                pseudo_aruco_path,
-                OWN_NORTH_COLUMNS,
-                OWN_EAST_COLUMNS,
-            )
-        except ValueError:
-            pass
-
-    try:
-        return read_trajectory_csv(
-            log_path,
-            ARUCO_NORTH_COLUMNS,
-            ARUCO_EAST_COLUMNS,
-        )
-    except ValueError:
-        return read_trajectory_csv(
-            log_path,
-            OWN_NORTH_COLUMNS,
-            OWN_EAST_COLUMNS,
-        )
+    del run_dir
+    # Webots comparison logs contain a complete ground-truth path in North/East.
+    # ARUCO samples are intermittent and can create artificial multi-metre jumps.
+    return read_trajectory_samples_csv(log_path, OWN_NORTH_COLUMNS, OWN_EAST_COLUMNS)
 
 
 def obstacle_candidates(payload):
@@ -496,27 +426,18 @@ def selected_run_dirs(logs_dir, run_dirs):
     return resolved
 
 
-def segment_for_plot(record, padding_s):
-    start_s, _ = record.active_window_s
-    lower_s = max(record.trajectory_time_s[0], start_s - padding_s)
-    mask = record.trajectory_time_s >= lower_s
-    if np.count_nonzero(mask) < 2:
-        return record.trajectory_ne_m
-    return record.trajectory_ne_m[mask]
-
-
 def merged_output_name(records):
     merged = "__".join(record.webots_environment for record in records)
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", merged).strip("_")
     return safe_name or "large_vs_small"
 
 
-def plot_group(records, output_path, padding_s):
+def plot_group(records, output_path):
     colors = {"Small": "#0072B2", "Large": "#D55E00"}
     fig, ax = plt.subplots(figsize=(9.5, 7.5))
 
     for record in sorted(records, key=lambda item: (item.size_label, item.size_metric_m, item.run_dir.name)):
-        segment_ne_m = segment_for_plot(record, padding_s)
+        trajectory_ne_m = record.trajectory_ne_m
         label = (
             f"{record.size_label} {record.run_dir.name} "
             f"(pc1={record.median_pc1_m:.2f} m; "
@@ -524,24 +445,24 @@ def plot_group(records, output_path, padding_s):
         )
         color = colors.get(record.size_label, "#333333")
         ax.plot(
-            segment_ne_m[:, 1],
-            segment_ne_m[:, 0],
+            trajectory_ne_m[:, 1],
+            trajectory_ne_m[:, 0],
             linewidth=2.0,
             color=color,
             alpha=0.88,
             label=label,
         )
         ax.scatter(
-            segment_ne_m[0, 1],
-            segment_ne_m[0, 0],
+            trajectory_ne_m[0, 1],
+            trajectory_ne_m[0, 0],
             color=color,
             marker="o",
             s=22,
             alpha=0.8,
         )
         ax.scatter(
-            segment_ne_m[-1, 1],
-            segment_ne_m[-1, 0],
+            trajectory_ne_m[-1, 1],
+            trajectory_ne_m[-1, 0],
             color=color,
             marker="x",
             s=42,
@@ -549,7 +470,7 @@ def plot_group(records, output_path, padding_s):
         )
         ax.annotate(
             record.size_label,
-            xy=(segment_ne_m[-1, 1], segment_ne_m[-1, 0]),
+            xy=(trajectory_ne_m[-1, 1], trajectory_ne_m[-1, 0]),
             xytext=(6, 6),
             textcoords="offset points",
             color=color,
@@ -608,7 +529,11 @@ def collect_grouped_runs(
 
 def pair_large_small_records(records):
     grouped = {}
-    for record in sorted(records, key=lambda item: item.run_dir.name, reverse=True):
+    for record in sorted(
+        records,
+        key=lambda item: (item.log_path.stat().st_mtime, item.run_dir.name),
+        reverse=True,
+    ):
         group = grouped.setdefault(record.webots_pair_key, {})
         group.setdefault(record.size_label, record)
     return [
@@ -621,7 +546,6 @@ def pair_large_small_records(records):
 def plot_colreg_size_trajectories(
     logs_dir,
     output_dir,
-    padding_s=2.0,
     latest_limit=DEFAULT_LATEST_LIMIT,
     run_dirs=None,
 ):
@@ -644,7 +568,7 @@ def plot_colreg_size_trajectories(
     outputs = []
     for pair in pairs:
         output_path = output_dir / f"{merged_output_name(pair)}.png"
-        plot_group(pair, output_path, padding_s=padding_s)
+        plot_group(pair, output_path)
         outputs.append((output_path, pair))
     return outputs
 
@@ -658,12 +582,6 @@ def main():
     )
     parser.add_argument("--logs-dir", type=Path, default=DEFAULT_LOGS_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument(
-        "--padding-s",
-        type=float,
-        default=2.0,
-        help="Trajectory padding before and after the active obstacle window.",
-    )
     parser.add_argument(
         "--latest-limit",
         type=int,
@@ -681,7 +599,6 @@ def main():
     outputs = plot_colreg_size_trajectories(
         logs_dir=args.logs_dir,
         output_dir=args.output_dir,
-        padding_s=float(args.padding_s),
         latest_limit=args.latest_limit,
         run_dirs=args.run_dirs,
     )

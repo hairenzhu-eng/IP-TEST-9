@@ -10,6 +10,7 @@ from matplotlib import pyplot as plt
 from matplotlib.patches import Circle
 import numpy as np
 
+from plot_apf_snapshots import break_path_jumps
 from plot_colreg_size_trajectories import read_trajectory
 from plot_log_sources import resolve_run_dir
 from webots_collision import collision_detected, collision_outcome_text
@@ -257,6 +258,20 @@ def find_log_in_run_dir(path):
         raise FileNotFoundError(f"No log_*.csv files found in {path}")
 
     return max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+
+
+def webots_name_from_log(log_path):
+    if log_path is None:
+        return None
+    try:
+        with Path(log_path).open(newline="", encoding="utf-8-sig") as stream:
+            row = next(csv.DictReader(stream), None)
+    except (OSError, csv.Error):
+        return None
+    if not row:
+        return None
+    value = str(row.get("WebotsEnvironment") or "").strip()
+    return Path(value).stem if value else None
 
 
 def default_strategy_source(name):
@@ -560,7 +575,9 @@ def latest_log_path(log_dir):
 
 def default_output_path(log_path, obstacle_dir, output_dir=DEFAULT_FIGURE_OUTPUT_DIR):
     if log_path is not None:
-        return output_dir / f"{log_path.stem}_obstacle_postprocess.png"
+        webots_name = webots_name_from_log(log_path)
+        name = safe_filename(webots_name) if webots_name else log_path.stem
+        return output_dir / f"{name}_obstacle_postprocess.png"
 
     if obstacle_dir is not None:
         return output_dir / f"{obstacle_dir.name}_obstacle_postprocess.png"
@@ -570,7 +587,9 @@ def default_output_path(log_path, obstacle_dir, output_dir=DEFAULT_FIGURE_OUTPUT
 
 def default_log_distance_output_path(log_path, obstacle_dir, output_dir=DEFAULT_FIGURE_OUTPUT_DIR):
     if log_path is not None:
-        return output_dir / f"{log_path.stem}_distance.png"
+        webots_name = webots_name_from_log(log_path)
+        name = safe_filename(webots_name) if webots_name else log_path.stem
+        return output_dir / f"{name}_distance.png"
 
     if obstacle_dir is not None:
         return output_dir / f"{obstacle_dir.name}_distance.png"
@@ -837,6 +856,12 @@ def collect_webots_switch_logs(log_dir):
         environment, switch = read_webots_switch(log_path)
         if not environment or switch not in SWITCH_ORDER:
             continue
+        if str(environment).strip().lower() in {
+            "webots_unknown",
+            "unknown",
+            "none",
+        }:
+            continue
         group = grouped.setdefault(environment, {})
         old_log_path = group.get(switch)
         if old_log_path is None or log_path.stat().st_mtime > old_log_path.stat().st_mtime:
@@ -910,9 +935,10 @@ def plot_webots_trajectory_comparison(environment, switch_logs, output_path):
         if len(times) < 2:
             continue
         label, color, linestyle = SWITCH_STYLES[switch]
+        trajectory_plot_ne_m = break_path_jumps(trajectory_ne_m)
         ax.plot(
-            trajectory_ne_m[:, 1],
-            trajectory_ne_m[:, 0],
+            trajectory_plot_ne_m[:, 1],
+            trajectory_plot_ne_m[:, 0],
             color=color,
             linestyle=linestyle,
             linewidth=2.0,
@@ -997,9 +1023,10 @@ def plot_postprocess(
 
     if robot_points:
         robot_array = np.asarray(robot_points, dtype=float)
+        robot_plot_array = break_path_jumps(robot_array)
         ax.plot(
-            robot_array[:, 1],
-            robot_array[:, 0],
+            robot_plot_array[:, 1],
+            robot_plot_array[:, 0],
             color="#1f77b4",
             linewidth=1.8,
             alpha=0.90,

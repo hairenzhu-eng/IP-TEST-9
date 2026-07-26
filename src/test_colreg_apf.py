@@ -93,6 +93,20 @@ def test_field_size_scales_are_independent_by_colreg_profile():
     assert controller.apf_field_size_scale({"virtual": True}, "static_obstacle") == 8.0
 
 
+def test_obstacle_track_state_keeps_ekf_heading():
+    from laptop import LaptopController
+
+    controller = LaptopController.__new__(LaptopController)
+    track = {
+        "state": np.array([0.0, 0.0, 1.0, 0.0], dtype=float),
+        "covariance": np.eye(4, dtype=float),
+    }
+
+    pos_ne, vel_ne = controller.obstacle_track_state_at(track, 1.0)
+    assert np.allclose(pos_ne, [1.0, 0.0])
+    assert np.allclose(vel_ne, [1.0, 0.0])
+
+
 def test_active_waypoint_survives_failed_periodic_replan():
     from laptop import LaptopController
 
@@ -225,6 +239,108 @@ def test_route_left_normal_matches_body_left():
     assert np.allclose(controller._route_normal_left_ne(), [-1.0, 0.0])
 
 
+def test_dcpa_ignores_dynamic_obstacle_after_route_crossing():
+    from laptop import LaptopController
+
+    controller = LaptopController.__new__(LaptopController)
+    controller.route_path_unit_ne = np.array([1.0, 0.0])
+    controller.start_ne = np.array([0.0, 0.0])
+    controller.route_path_length_m = 20.0
+    controller.route_tracking_lookahead_m = 1.0
+    controller.apf_collision_horizon_s = 6.0
+    controller.apf_own_equivalent_radius_m = 0.3
+    controller.apf_path_threshold_m = 0.1
+    controller.obstacle_min_pc1_m = 0.3
+    controller.obstacle_min_pc2_m = 0.2
+    controller._current_ne = lambda: np.array([5.0, 0.0])
+
+    approaching = {"centre_ne": [6.0, 2.0], "velocity_ne": [0.0, -1.0], "pc1_m": 1.0, "pc2_m": 0.5}
+    leaving = {"centre_ne": [6.0, 2.0], "velocity_ne": [0.0, 0.5], "pc1_m": 1.0, "pc2_m": 0.5}
+    assert controller._obstacle_can_affect_route(approaching)
+    assert not controller._obstacle_can_affect_route(leaving)
+
+
+def test_dcpa_predicts_from_current_robot_velocity_not_route():
+    from laptop import LaptopController
+
+    controller = LaptopController.__new__(LaptopController)
+    controller.__dict__.update(
+        obstacle_ekf_prediction_enabled=True,
+        latest_lidar_received_s=0.0,
+        apf_track_timeout_s=10.0,
+        apf_prediction_dt_s=1.0,
+        apf_collision_horizon_s=4.0,
+        apf_own_equivalent_radius_m=0.1,
+        apf_predicted_field_size_scale=4.0,
+        apf_cluster_range_enabled=True,
+        obstacle_min_pc1_m=0.3,
+        obstacle_min_pc2_m=0.2,
+        route_path_unit_ne=np.array([1.0, 0.0]),
+        start_ne=np.array([0.0, 0.0]),
+        route_path_length_m=10.0,
+        v_robot=np.array([0.0, 1.0, 0.0]),
+        apf_obstacle_tracks=[
+            {
+                "id": 1,
+                "last_seen_s": 0.0,
+                "state": np.array([0.0, 3.0, 0.25, -np.pi / 2.0]),
+                "pc1_m": 1.0,
+                "pc2_m": 1.0,
+                "length_axis_ne": np.array([1.0, 0.0]),
+            }
+        ],
+    )
+    controller._current_ne = lambda: np.array([0.0, 0.0])
+    controller.obstacle_track_motion_is_stable = lambda _track: True
+    controller.earth_point_to_body = lambda point: np.asarray(point, dtype=float)
+
+    virtuals = controller.update_apf_virtual_obstacles()
+
+    assert len(virtuals) == 1
+    assert np.allclose(virtuals[0]["collision_position_ne"], [0.0, 2.4])
+    assert np.allclose(virtuals[0]["own_prediction_ne"], [0.0, 2.4])
+    assert np.allclose(virtuals[0]["centre_ne"], [0.0, 2.4])
+    assert np.isclose(virtuals[0]["dcpa_m"], 0.0)
+
+
+def test_dcpa_uses_track_state_at_current_snapshot_time():
+    from laptop import LaptopController
+
+    controller = LaptopController.__new__(LaptopController)
+    controller.__dict__.update(
+        obstacle_ekf_prediction_enabled=True,
+        latest_lidar_received_s=2.0,
+        apf_track_timeout_s=10.0,
+        apf_prediction_dt_s=1.0,
+        apf_collision_horizon_s=4.0,
+        apf_own_equivalent_radius_m=0.1,
+        apf_predicted_field_size_scale=4.0,
+        apf_cluster_range_enabled=True,
+        obstacle_min_pc1_m=0.3,
+        obstacle_min_pc2_m=0.2,
+        v_robot=np.array([0.0, 1.0, 0.0]),
+        apf_obstacle_tracks=[
+            {
+                "id": 1,
+                "stamp_s": 0.0,
+                "last_seen_s": 2.0,
+                "state": np.array([0.0, 3.0, 0.25, -np.pi / 2.0]),
+                "pc1_m": 1.0,
+                "pc2_m": 1.0,
+                "length_axis_ne": np.array([1.0, 0.0]),
+            }
+        ],
+    )
+    controller._current_ne = lambda: np.array([0.0, 0.0])
+    controller.obstacle_track_motion_is_stable = lambda _track: True
+    controller.earth_point_to_body = lambda point: np.asarray(point, dtype=float)
+
+    virtuals = controller.update_apf_virtual_obstacles()
+
+    assert len(virtuals) == 1
+    assert np.allclose(virtuals[0]["dcpa_position_ne"], [0.0, 2.0])
+
+
 def test_feature_switches_and_cluster_size_fallback():
     from laptop import LaptopController, _switches_from_combination
 
@@ -251,11 +367,14 @@ if __name__ == "__main__":
     test_only_dynamic_ellipse_fade()
     test_crossing_passes_astern()
     test_repulsion_uses_the_locked_colreg_side()
+    test_obstacle_track_state_keeps_ekf_heading()
     test_active_waypoint_survives_failed_periodic_replan()
     test_dynamic_replan_replaces_current_target()
     test_waypoint_path_never_targets_behind_robot()
     test_terminal_waypoint_stays_active_until_goal_tolerance()
     test_planned_detour_rejoins_route_and_ends_at_goal()
     test_route_left_normal_matches_body_left()
+    test_dcpa_predicts_from_current_robot_velocity_not_route()
+    test_dcpa_uses_track_state_at_current_snapshot_time()
     test_feature_switches_and_cluster_size_fallback()
     print("COLREG/APF checks passed")
