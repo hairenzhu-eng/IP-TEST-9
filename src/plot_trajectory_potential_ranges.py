@@ -44,9 +44,7 @@ def webots_name(run_dir):
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        context = payload.get("run_context", {})
-        name = context.get("webots_environment") if isinstance(context, dict) else None
-        name = name or payload.get("wbots_name")
+        name = payload.get("run_context", {}).get("webots_environment")
         if name and str(name).upper() not in {"WEBOTS_UNKNOWN", "UNKNOWN"}:
             return Path(str(name)).name
     return None
@@ -54,7 +52,7 @@ def webots_name(run_dir):
 
 def latest_runs_by_webots(logs_dir):
     latest = {}
-    for run_dir in logs_dir.iterdir():
+    for run_dir in logs_dir.glob("run_*"):
         if not run_dir.is_dir() or not list(run_dir.glob("obstacle_*.json")):
             continue
         name = webots_name(run_dir)
@@ -116,7 +114,7 @@ def plot(run_dir, output, target_snapshot=None):
                 if candidate is not None:
                     bounds_points.append(candidate)
         fields = item.get("potential_fields", {})
-        for group in ("real", "predicted", "continuous"):
+        for group in ("actual", "predicted", "continuous"):
             for field in fields.get(group, []):
                 candidate = point(field.get("position_ne"))
                 if candidate is not None:
@@ -143,9 +141,9 @@ def plot(run_dir, output, target_snapshot=None):
 
     current = snapshots[-1]
     fields = current.get("potential_fields", {})
-    real_fields = fields.get("real", [])
-    if real_fields:
-        for field in real_fields:
+    actual_fields = fields.get("actual", [])
+    if actual_fields:
+        for field in actual_fields:
             geometry = field_geometry(field, settings)
             if geometry is not None:
                 add_range(ax, *geometry, "Real potential field", "#d62728")

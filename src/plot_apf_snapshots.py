@@ -17,7 +17,6 @@ from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse
 import numpy as np
-
 from webots_collision import collision_outcome_text
 
 
@@ -1018,29 +1017,30 @@ def obstacle_reference_points(payload):
 
 
 def webots_truth_run_path(snapshots):
+    """Return one Webots truth point per snapshot, selected by timestamp."""
     values = []
-    anchors = []
     for snapshot in snapshots:
         payload = snapshot["payload"]
-        path = webots_truth_path(payload)
-        if not len(path):
+        records = payload.get("webots_obstacle_truth", [])
+        if not isinstance(records, list):
             continue
-        position = path[-1]
-        values.append(position)
-        references = obstacle_reference_points(payload)
-        if len(references) and float(np.min(np.linalg.norm(references - position, axis=1))) <= 2.5:
-            anchors.append(position)
-
-    values = np.asarray(values, dtype=float)
-    anchors = np.asarray(anchors, dtype=float)
-    if len(anchors) < 2:
-        return values
-
-    centred_anchors = anchors - np.mean(anchors, axis=0)
-    _, _, axes = np.linalg.svd(centred_anchors, full_matrices=False)
-    normal = axes[-1]
-    line_distance = np.abs((values - np.mean(anchors, axis=0)) @ normal)
-    return values[line_distance <= 0.35]
+        snapshot_time = parse_float(payload.get("t"))
+        timed = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            position = point(record.get("position_ne"))
+            record_time = parse_float(record.get("t"))
+            if position is not None and np.isfinite(record_time):
+                timed.append((record_time, position))
+        if not timed:
+            path = webots_truth_path(payload)
+            if len(path):
+                values.append(path[-1])
+            continue
+        eligible = [item for item in timed if item[0] <= snapshot_time + 1e-6]
+        values.append(max(eligible or timed, key=lambda item: item[0])[1])
+    return np.asarray(values, dtype=float)
 
 
 def webots_truth_position(payload, run_path):
@@ -1927,8 +1927,8 @@ def _self_check():
         {"payload": {"tracks": [{"position_ne": [4.8, 2.0]}], "webots_obstacle_truth": [{"position_ne": [2.0, -1.0]}]}},
     ]
     filtered_truth = webots_truth_run_path(mixed_truth)
-    assert filtered_truth.tolist() == [[4.8, 0.0], [4.8, 1.0]]
-    assert np.allclose(webots_truth_position(mixed_truth[-1]["payload"], filtered_truth), [4.8, 1.0])
+    assert filtered_truth.tolist() == [[4.8, 0.0], [4.8, 1.0], [2.0, -1.0]]
+    assert np.allclose(webots_truth_position(mixed_truth[-1]["payload"], filtered_truth), [2.0, -1.0])
     assert [1.0, 2.0] in all_run_points([
         {"payload": {"webots_obstacle_truth": [{"position_ne": [1, 2]}]}}
     ]).tolist()

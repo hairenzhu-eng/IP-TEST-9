@@ -180,14 +180,16 @@ def test_terminal_waypoint_stays_active_until_goal_tolerance():
     controller.apf_waypoint_acceptance_m = 0.45
     controller.apf_waypoint_path_ne = [controller.goal_ne.copy()]
     controller.apf_waypoint_index = 0
-    controller._update_display_waypoints = lambda: None
+    controller.goal_distance_m = lambda: 0.2
+    displayed = []
+    controller._update_display_waypoints = lambda: displayed.append(True)
     cleared = []
     controller._clear_apf_waypoint_path = lambda: cleared.append(True)
 
     controller._advance_apf_waypoint_progress(np.array([14.5, 1.0]))
     assert controller.apf_waypoint_index == 0 and not cleared
     controller._advance_apf_waypoint_progress(np.array([14.8, 1.0]))
-    assert controller.apf_waypoint_index == 1 and cleared
+    assert controller.apf_waypoint_index == 0 and not cleared and displayed
 
 
 def test_planned_detour_rejoins_route_and_ends_at_goal():

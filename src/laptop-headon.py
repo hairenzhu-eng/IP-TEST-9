@@ -18,7 +18,7 @@ def wrap_angle(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 class LaptopController:
-    obstacle_ekf_prediction_enabled = False
+    obstacle_ekf_prediction_enabled = True
 
     def earth_vector_to_body(self, vector_ne):
         pose = np.asarray(self.p_robot, dtype=float).reshape(-1)
@@ -62,13 +62,14 @@ class LaptopController:
         dt2 = dt * dt
         dt3 = dt2 * dt
         dt4 = dt2 * dt2
-        return q * np.array([[0.25 * dt4, 0.0, 0.5 * dt3, 0.0], [0.0, 0.25 * dt4, 0.0, 0.5 * dt3], [0.5 * dt3, 0.0, dt2, 0.0], [0.0, 0.5 * dt3, 0.0, dt2]], dtype=float)
+        return np.diag([q * dt4 / 4, q * dt4 / 4, q * dt2, q * dt2, q * dt, q * dt, q * dt])
 
     def obstacle_ekf_predict(self, state, covariance, dt):
         dt = max(float(dt), 0.0)
-        state = np.asarray(state, dtype=float).reshape(4)
-        covariance = np.asarray(covariance, dtype=float).reshape(4, 4)
-        F = np.array([[1.0, 0.0, dt, 0.0], [0.0, 1.0, 0.0, dt], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], dtype=float)
+        state = np.asarray(state, dtype=float).reshape(7)
+        covariance = np.asarray(covariance, dtype=float).reshape(7, 7)
+        F = np.eye(7, dtype=float)
+        F[0, 2] = F[1, 3] = dt
         predicted_state = F @ state
         predicted_covariance = F @ covariance @ F.T + self.obstacle_ekf_process_noise(dt)
         return (predicted_state, predicted_covariance)
@@ -97,7 +98,7 @@ class LaptopController:
         for track in self.apf_obstacle_tracks:
             if now - float(track.get('last_seen_s', track.get('stamp_s', now))) > self.apf_track_timeout_s:
                 continue
-            predicted_state, _ = self.obstacle_ekf_predict(track.get('state', np.r_[track.get('pos_ne', [np.nan, np.nan]), track.get('vel_ne', [0.0, 0.0])]), track.get('covariance', np.eye(4, dtype=float)), max(now - float(track.get('stamp_s', now)), 0.0))
+            predicted_state, _ = self.obstacle_ekf_predict(track.get('state', np.full(7, np.nan)), track.get('covariance', np.eye(7, dtype=float)), max(now - float(track.get('stamp_s', now)), 0.0))
             predicted_pos = predicted_state[0:2]
             distance = float(np.linalg.norm(centre_ne - predicted_pos))
             if distance < best_distance:
@@ -142,7 +143,7 @@ class LaptopController:
 
     def obstacle_track_state_at(self, track, dt_s):
         dt_s = max(float(dt_s), 0.0)
-        state = np.asarray(track.get('state', [np.nan, np.nan, 0.0, 0.0]), dtype=float).reshape(4)
+        state = np.asarray(track.get('state', [np.nan] * 7), dtype=float).reshape(-1)[:4]
         if not np.isfinite(state).all():
             return (None, None)
         velocity_ne = state[2:4].copy()

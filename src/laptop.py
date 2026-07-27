@@ -410,8 +410,8 @@ class _ControllerCore:
         self.apf_virtual_pc_scale = 3.0
         self.apf_activation_front_half_angle_rad = np.deg2rad(150.0)
         self.apf_priority_front_half_angle_rad = np.deg2rad(90.0)
-        self.apf_goal_gain = 5.5
-        self.apf_path_gain = 5.5
+        self.apf_goal_gain = 8.0
+        self.apf_path_gain = 10.0
         self.apf_repulsive_gain = 0.08
         self.apf_attraction_saturation_m = 3.5
         self.apf_path_threshold_m = 0.10
@@ -462,6 +462,7 @@ class _ControllerCore:
         self.apf_obstacle_tracks = []
         self.apf_obstacle_track_candidates = []
         self.apf_virtual_obstacles = []
+        self.apf_continuous_field_distance_m = {}
         self.obstacle_ekf_measurement_std_m = 0.08 if self.OPERATING_MODE == 2 else 0.12
         self.obstacle_ekf_accel_std_m_s2 = 0.20 if self.OPERATING_MODE == 2 else 0.35
         self.obstacle_ekf_initial_position_std_m = 0.20
@@ -1623,6 +1624,8 @@ class _ControllerCore:
             "last_seen_s": float(stamp_s),
             "hit_count": 1,
             "miss_count": 0,
+            "last_detection_ne": np.asarray(detection_ne, dtype=float).copy(),
+            "last_detection_s": float(stamp_s),
             "history_ne": [],
             "lidar_history_ne": [],
             "motion_window": [],
@@ -1992,7 +1995,13 @@ class _ControllerCore:
                 dt,
             )
             predicted_tracks.append((predicted_state, predicted_covariance))
+            # Match against the last measured position as well as the EKF
+            # prediction.  A zero-velocity first state otherwise leaves a
+            # moving target frozen when the first prediction is stale.
             predicted_pos = predicted_state[0:2]
+            last_detection = np.asarray(track.get("last_detection_ne", predicted_pos), dtype=float).reshape(2)
+            if np.isfinite(last_detection).all():
+                predicted_pos = last_detection
 
             for detection_index, detection in enumerate(detection_positions):
                 distance = float(np.linalg.norm(detection - predicted_pos))
@@ -2018,6 +2027,14 @@ class _ControllerCore:
                 detection,
                 detections[detection_index][5],
             )
+            previous_detection = track.get("last_detection_ne")
+            previous_stamp = track.get("last_detection_s")
+            if previous_detection is not None and previous_stamp is not None:
+                dt_measurement = now - float(previous_stamp)
+                if dt_measurement > 1e-3:
+                    measured_velocity = (detection - np.asarray(previous_detection, dtype=float)) / dt_measurement
+                    if np.isfinite(measured_velocity).all():
+                        corrected_state[2:4] = measured_velocity
             corrected_state[4:6] = detections[detection_index][2:4]
 
             track["state"] = corrected_state
@@ -2026,6 +2043,8 @@ class _ControllerCore:
             track["last_seen_s"] = now
             track["hit_count"] = int(track.get("hit_count", 0)) + 1
             track["miss_count"] = 0
+            track["last_detection_ne"] = detection.copy()
+            track["last_detection_s"] = now
             self.sync_obstacle_track_fields(track)
             self.append_obstacle_track_history(
                 track,
@@ -3231,7 +3250,6 @@ import sys
 from types import MethodType
 
 import numpy as np
-from behavior_tree import BTAction, BTCondition, BTSelector, BTSequence, BTStatus
 from colreg_apf import classify_colreg_zone, obstacle_stern_waypoint, smooth_ellipse_repulsion, straight_line_cpa
 
 
@@ -3311,8 +3329,8 @@ UNIFIED_APF_PARAMS = {
     "apf_virtual_pc_scale": 4.0,
     "apf_activation_front_half_angle_rad": np.deg2rad(150.0),
     "apf_priority_front_half_angle_rad": np.deg2rad(90.0),
-    "apf_goal_gain": 5.5,
-    "apf_path_gain": 7.5,
+    "apf_goal_gain": 8.0,
+    "apf_path_gain": 10.0,
     # Single calibrated gain for both dynamic ellipse fields.  Their geometry
     # remains 2.5x (current) and 4x (predicted).
     "apf_repulsive_gain": 3.0,
@@ -3556,9 +3574,6 @@ class LaptopController(_OvertakingController):
         self.apf_waypoint_force_blend = 0.65
         self.apf_waypoint_speed_m_s = float(self.route_tracking_speed_m_s)
         self._plan_initial_route()
-        self._colreg_recognition_bt = self._build_colreg_recognition_behavior_tree()
-        self._colreg_avoidance_bt = self._build_colreg_avoidance_behavior_tree()
-        self._colreg_bt = self._build_colreg_behavior_tree()
 
     def _current_ne(self):
         return np.array([float(self.North), float(self.East)], dtype=float)
@@ -3730,17 +3745,38 @@ class LaptopController(_OvertakingController):
         return self.start_ne + along[:, None] * route
 
     def obstacle_track_state_at(self, track, dt_s):
-        """Predict the 4-D [north, east, v_north, v_east] EKF state."""
-        state = np.asarray(track.get("state", [np.nan] * 4), dtype=float).reshape(4)
+        """Predict position and velocity from the obstacle EKF state."""
+        raw_state = np.asarray(track.get("state", [np.nan] * 7), dtype=float).reshape(-1)
+        state = raw_state[:4]
         position_ne = state[:2]
         velocity_ne = state[2:4]
         if not np.isfinite(position_ne).all() or not np.isfinite(velocity_ne).all():
             return None, None
         return position_ne + velocity_ne * max(float(dt_s), 0.0), velocity_ne.copy()
 
+    def obstacle_track_field_state_at(self, track, dt_s):
+        """Return position, velocity, pc1, pc2 and predicted heading at dt_s."""
+        raw_state = np.asarray(track.get("state", [np.nan] * 7), dtype=float).reshape(-1)
+        if raw_state.size < 7 or not np.isfinite(raw_state[:6]).all():
+            return None
+        position_ne, velocity_ne = self.obstacle_track_state_at(track, dt_s)
+        if position_ne is None or velocity_ne is None:
+            return None
+        accel_ne = self.obstacle_track_prediction_accel_ne(track)
+        dt_s = max(float(dt_s), 0.0)
+        velocity_ne = velocity_ne + accel_ne * dt_s
+        speed_m_s = float(np.linalg.norm(velocity_ne))
+        heading_rad = (
+            float(np.arctan2(velocity_ne[1], velocity_ne[0]))
+            if speed_m_s >= 1e-6
+            else float(raw_state[6])
+        )
+        return position_ne, velocity_ne, max(float(raw_state[4]), self.obstacle_min_pc1_m), max(float(raw_state[5]), self.obstacle_min_pc2_m), heading_rad
+
     def update_apf_virtual_obstacles(self):
         """Build the 2×TCPA field and overlapping bridge from each live EKF track."""
         self.apf_virtual_obstacles = []
+        self.apf_continuous_field_distance_m = {}
         if not self.obstacle_ekf_prediction_enabled:
             return self.apf_virtual_obstacles
 
@@ -3777,6 +3813,8 @@ class LaptopController(_OvertakingController):
 
             pc1_m, pc2_m = self.obstacle_pc_dimensions(track)
             final_ne = start_ne + velocity_ne * (2.0 * tcpa_s)
+            continuous_line_distance_m = float(np.linalg.norm(final_ne - start_ne))
+            self.apf_continuous_field_distance_m[int(track.get("id", 0))] = continuous_line_distance_m
             field_half_along_m = self.apf_predicted_field_size_scale * (
                 0.5 * pc1_m + self.apf_own_equivalent_radius_m
             )
@@ -3784,14 +3822,12 @@ class LaptopController(_OvertakingController):
                 0.5 * pc2_m + self.apf_own_equivalent_radius_m
             )
             base_radius_m = min(pc1_m, pc2_m) * 0.5 + self.apf_own_equivalent_radius_m
-            def field(position_ne, velocity_at_ne, pc1_at_m, pc2_at_m, heading_at_rad, bridge=False, prediction_dt_s=None):
+            def field(position_ne, velocity_at_ne, pc1_at_m, pc2_at_m, heading_at_rad, bridge=False, prediction_dt_s=None, continuous_distance_m=None):
                 speed_at_m_s = float(np.linalg.norm(velocity_at_ne))
-                axis_angle = float(np.arctan2(velocity_at_ne[1], velocity_at_ne[0]))
-                # COLREG/APF axis: measured ship heading + predicted EKF heading.
-                measured_axis = self.obstacle_length_axis_ne(track)
-                measured_angle = float(np.arctan2(measured_axis[1], measured_axis[0]))
-                axis_ne = np.array([np.cos(measured_angle + heading_at_rad),
-                                    np.sin(measured_angle + heading_at_rad)])
+                # pc1 axis: current obstacle heading + the heading predicted at this field point.
+                current_heading = float(track.get("heading_rad", 0.0))
+                axis_ne = np.array([np.cos(current_heading + heading_at_rad),
+                                    np.sin(current_heading + heading_at_rad)])
                 return {
                     "label": -1000 - int(track.get("id", 0)), "virtual": True,
                     "bridge": bridge, "track_id": int(track.get("id", 0)),
@@ -3811,28 +3847,38 @@ class LaptopController(_OvertakingController):
                     "own_prediction_velocity_ne": own_velocity_ne.tolist(),
                     "own_prediction_heading_rad": float(self.Yaw),
                     "prediction_dt_s": prediction_dt_s,
+                    "continuous_line_distance_m": continuous_line_distance_m,
+                    "continuous_distance_m": continuous_distance_m,
                     "predicted_risk_active": True,
                 }
 
             # Continuous field: EKF-predicted positions sampled with the
             # requested dt = 0.5 * previous pc1 / previous predicted speed.
+            # Start at the measured cluster.  Each following centre is the
+            # preceding centre + its EKF velocity * dt.
             position_ne = start_ne.copy()
             elapsed_s = 0.0
             previous_pc1_m = pc1_m
+            previous_speed_m_s = speed_m_s
+            continuous_distance_m = 0.0
             while elapsed_s < 2.0 * tcpa_s - 1e-9:
-                predicted_pos, predicted_vel = self.obstacle_track_state_at(track, elapsed_s)
-                predicted_speed = float(np.linalg.norm(predicted_vel))
-                if predicted_pos is None or predicted_speed < 1e-6:
+                field_state = self.obstacle_track_field_state_at(track, elapsed_s)
+                if field_state is None:
                     break
-                heading_rad = float(np.arctan2(predicted_vel[1], predicted_vel[0]))
-                dt_s = max(0.5 * previous_pc1_m / predicted_speed, 1e-3)
+                _, predicted_vel, predicted_pc1_m, predicted_pc2_m, heading_rad = field_state
+                if previous_speed_m_s < 1e-6:
+                    break
+                dt_s = max(0.5 * previous_pc1_m / previous_speed_m_s, 1e-3)
                 self.apf_virtual_obstacles.append(field(
-                    predicted_pos, predicted_vel, previous_pc1_m, pc2_m,
-                    heading_rad, bridge=True, prediction_dt_s=dt_s
+                    position_ne, predicted_vel, predicted_pc1_m, predicted_pc2_m,
+                    heading_rad, bridge=True, prediction_dt_s=dt_s,
+                    continuous_distance_m=continuous_distance_m,
                 ))
+                position_ne = position_ne + predicted_vel * dt_s
+                continuous_distance_m += float(np.linalg.norm(predicted_vel * dt_s))
                 elapsed_s += dt_s
-                position_ne = predicted_pos
-                previous_pc1_m = pc1_m
+                previous_pc1_m = predicted_pc1_m
+                previous_speed_m_s = float(np.linalg.norm(predicted_vel))
             # Keep the 2*TCPA virtual field unchanged.
             self.apf_virtual_obstacles.append(field(final_ne, velocity_ne, pc1_m, pc2_m,
                                                     float(np.arctan2(velocity_ne[1], velocity_ne[0])),
@@ -3915,17 +3961,22 @@ class LaptopController(_OvertakingController):
                 self.apf_waypoint_path_ne[self.apf_waypoint_index],
                 dtype=float,
             ).reshape(2)
+            is_goal_waypoint = (
+                self.apf_waypoint_index == len(self.apf_waypoint_path_ne) - 1
+                and np.allclose(waypoint_ne, self.goal_ne)
+            )
             acceptance_m = (
                 self.goal_tolerance_m
-                if self.apf_waypoint_index == len(self.apf_waypoint_path_ne) - 1
-                and np.allclose(waypoint_ne, self.goal_ne)
+                if is_goal_waypoint
                 else self.apf_waypoint_acceptance_m
             )
             if float(np.linalg.norm(waypoint_ne - current_ne)) > acceptance_m:
                 break
+            if is_goal_waypoint:
+                break
             self.apf_waypoint_index += 1
 
-        if not self._apf_waypoint_path_active():
+        if not self._apf_waypoint_path_active() and self.goal_distance_m() > self.goal_tolerance_m:
             self._clear_apf_waypoint_path()
         else:
             self._update_display_waypoints()
@@ -4145,8 +4196,7 @@ class LaptopController(_OvertakingController):
             return False
 
         if not self._main_route_has_collision_risk():
-            self._clear_apf_waypoint_path()
-            return False
+            return self._apf_waypoint_path_active()
 
         current_ne = self._current_ne()
         current_along_m, _, _ = self._project_to_main_route(current_ne)
@@ -4285,7 +4335,7 @@ class LaptopController(_OvertakingController):
         )
 
     def _ensure_apf_waypoint_path(self):
-        if not self._main_route_has_collision_risk():
+        if not self._main_route_has_collision_risk() and not self._apf_waypoint_path_active():
             self._clear_apf_waypoint_path()
             return False
         now_s = float(self.timefromstart) if self.timefromstart is not None else 0.0
@@ -4309,6 +4359,9 @@ class LaptopController(_OvertakingController):
                     self._clear_apf_waypoint_path()
                 elif now_s - self.apf_waypoint_planned_at_s < self.apf_waypoint_replan_interval_s:
                     return True
+                # Replan on the interval even when the current target is not
+                # blocked: moving obstacles can change the safest detour before
+                # they reach the existing waypoint.
         return self._plan_apf_waypoint_path() or self._apf_waypoint_path_active()
 
     def _compute_waypoint_tracking_control(self, navigation_mode):
@@ -4371,7 +4424,11 @@ class LaptopController(_OvertakingController):
         return _OvertakingController.limit_heading_deviation_command(self, yaw_rate_cmd)
 
     def update_apf_obstacle_tracks(self, stamp_s):
-        _CrossingController.update_apf_obstacle_tracks(self, stamp_s)
+        # The live controller owns a 7-state obstacle EKF
+        # [north, east, vn, ve, pc1, pc2, heading].  crossing.py's tracker
+        # is 4-state and its 2x4 association matrix cannot consume this
+        # covariance.
+        return _OvertakingController.update_apf_obstacle_tracks(self, stamp_s)
 
     def _run_context(self):
         return {
@@ -4727,21 +4784,10 @@ class LaptopController(_OvertakingController):
         self._last_colreg_decision = best
         return rule
 
-    def _build_colreg_recognition_behavior_tree(self):
-        def recognize_rule(bb):
-            bb["rule"] = self._select_colreg_strategy_impl()
-            return BTStatus.SUCCESS
-
-        return BTSequence(BTAction(recognize_rule))
-
     # COLREG rule detection location.
     def select_colreg_strategy(self):
-        """Pick the current primary COLREG rule without creating another controller."""
-        blackboard = {}
-        status = self._colreg_recognition_bt.tick(blackboard)
-        if status != BTStatus.SUCCESS:
-            return "none"
-        return blackboard.get("rule", "none")
+        """Pick the current primary COLREG rule directly."""
+        return self._select_colreg_strategy_impl()
 
     def apf_primary_encounter_mode(self):
         return self.select_colreg_strategy()
@@ -4759,55 +4805,16 @@ class LaptopController(_OvertakingController):
         else:
             self.apf_selected_controller = "default_apf"
 
-    def _build_colreg_behavior_tree(self):
-        def keep_selected_rule(bb):
-            bb["rule"] = bb.get("rule", "none")
-            return BTStatus.SUCCESS
-
-        def dispatch_head_on(bb):
-            with self._head_on_strategy_methods():
-                bb["u_cmd"] = _HeadOnController.compute_apf_control(self, bb["t"], bb["u_track"])
-            return BTStatus.SUCCESS
-
-        def dispatch_overtaking(bb):
-            bb["u_cmd"] = _OvertakingController.compute_apf_control(self, bb["t"], bb["u_track"])
-            return BTStatus.SUCCESS
-
-        def dispatch_crossing(bb):
-            with self._crossing_strategy_methods():
-                bb["u_cmd"] = _CrossingController.compute_apf_control(self, bb["t"], bb["u_track"])
-            return BTStatus.SUCCESS
-
-        def dispatch_default(bb):
-            bb["u_cmd"] = _OvertakingController.compute_apf_control(self, bb["t"], bb["u_track"])
-            return BTStatus.SUCCESS
-
-        def is_head_on(bb):
-            return bb.get("rule") in self._HEAD_ON_RULES
-
-        def is_overtaking(bb):
-            return bb.get("rule") in self._OVERTAKING_RULES
-
-        def is_crossing(bb):
-            return bb.get("rule") in self._CROSSING_RULES
-
-        return BTSequence(
-            BTAction(keep_selected_rule),
-            BTSelector(
-                BTSequence(BTCondition(is_head_on), BTAction(dispatch_head_on)),
-                BTSequence(BTCondition(is_overtaking), BTAction(dispatch_overtaking)),
-                BTSequence(BTCondition(is_crossing), BTAction(dispatch_crossing)),
-                BTAction(dispatch_default),
-            ),
-        )
-
-    def _tick_colreg_bt(self, rule, t, u_track):
-        blackboard = {"rule": rule, "t": t, "u_track": u_track}
+    def _dispatch_colreg_strategy(self, rule, t, u_track):
+        """Dispatch the selected COLREG strategy without an intermediate framework."""
         self._mark_selected_controller(rule)
-        status = self._colreg_bt.tick(blackboard)
-        if status != BTStatus.SUCCESS:
-            return None
-        return blackboard.get("u_cmd")
+        if rule in self._HEAD_ON_RULES:
+            with self._head_on_strategy_methods():
+                return _HeadOnController.compute_apf_control(self, t, u_track)
+        if rule in self._CROSSING_RULES:
+            with self._crossing_strategy_methods():
+                return _CrossingController.compute_apf_control(self, t, u_track)
+        return _OvertakingController.compute_apf_control(self, t, u_track)
 
     def _apf_avoidance_needed_impl(self, selected_rule):
         self._mark_selected_controller(selected_rule)
@@ -4818,13 +4825,6 @@ class LaptopController(_OvertakingController):
             with self._crossing_strategy_methods():
                 return _CrossingController.apf_avoidance_needed(self)
         return _OvertakingController.apf_avoidance_needed(self)
-
-    def _build_colreg_avoidance_behavior_tree(self):
-        def evaluate_avoidance(bb):
-            bb["result"] = self._apf_avoidance_needed_impl(bb.get("rule", "none"))
-            return BTStatus.SUCCESS
-
-        return BTSequence(BTAction(evaluate_avoidance))
 
     def _waypoint_speed_from_command(self, u_cmd):
         if "overtaking" in str(getattr(self, "webots_environment", "")).lower():
@@ -4863,9 +4863,7 @@ class LaptopController(_OvertakingController):
             return u_cmd
 
         selected_rule = self.select_colreg_strategy()
-        u_cmd = self._tick_colreg_bt(selected_rule, t, u_track)
-        if u_cmd is None:
-            u_cmd = _OvertakingController.compute_apf_control(self, t, u_track)
+        u_cmd = self._dispatch_colreg_strategy(selected_rule, t, u_track)
         if "overtaking" in str(getattr(self, "webots_environment", "")).lower():
             u_cmd[0, 0] = self.route_tracking_speed_m_s
         self.apf_waypoint_speed_m_s = self._waypoint_speed_from_command(u_cmd)
@@ -4893,18 +4891,22 @@ class LaptopController(_OvertakingController):
 
     def apf_avoidance_needed(self):
         self.select_colreg_strategy()
-        risk_active = self._main_route_has_collision_risk()
-        if not risk_active:
-            self._clear_apf_waypoint_path()
+        risk_active = self._main_route_has_collision_risk() or self._apf_waypoint_path_active()
         return risk_active
 
     def compute_route_tracking_control(self, t):
-        if self._apf_waypoint_path_active() and not self._main_route_has_collision_risk():
-            self._clear_apf_waypoint_path()
-        tracking = self._compute_waypoint_tracking_control("apf_return")
+        # This method runs before the APF branch in the live control loop.
+        # Refresh here as well, otherwise an active detour is only replanned
+        # on frames where APF happens to be selected.
+        if self.apf_waypoint_detour_enabled and (
+            self._apf_waypoint_path_active() or self._main_route_has_collision_risk()
+        ):
+            self._ensure_apf_waypoint_path()
+        tracking = self._compute_waypoint_tracking_control("apf_waypoint")
         if tracking is not None:
             return tracking
-        self._clear_apf_waypoint_path()
+        if self.goal_distance_m() > self.goal_tolerance_m:
+            self._clear_apf_waypoint_path()
         return _OvertakingController.compute_route_tracking_control(self, t)
 
     def write_obstacle_snapshot(self):
