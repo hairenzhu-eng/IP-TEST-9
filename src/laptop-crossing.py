@@ -633,7 +633,8 @@ class LaptopController:
         lateral_speed = float(obs_vel_body[1])
         if abs(lateral_speed) < self.apf_dynamic_speed_threshold_m_s:
             return 0.0
-        return float(np.sign(lateral_speed))
+        # The stern is opposite the detected motion direction.
+        return float(-np.sign(lateral_speed))
 
     def apf_obstacle_endpoint_direction_body(self, obs_pos_body, obs_vel_body, obstacle, along_sign):
         obs_pos_body = np.asarray(obs_pos_body, dtype=float).reshape(2)
@@ -831,6 +832,12 @@ class LaptopController:
                     obstacle_encounter = obstacle.get('encounter_mode', self.apf_encounter_mode)
                     clearance_offset_m = max(clearance_offset_m, self.apf_direction_clearance_m(obstacle, obstacle_encounter))
                     nearest_active_level = min(nearest_active_level, self.apf_obstacle_level_and_away(obstacle, avoidance_pc_scale, encounter=obstacle_encounter)[0])
+        if (
+            any_repulsion
+            and self.apf_side_lock_sign != 0.0
+            and str(self.apf_encounter_mode).startswith('crossing')
+        ):
+            attractive_force *= float(getattr(self, 'apf_crossing_attraction_scale', 0.10))
         if any_repulsion and self.apf_side_lock_sign != 0.0:
             route_normal_left_ne = np.array([self.route_path_unit_ne[1], -self.route_path_unit_ne[0]], dtype=float)
             offset_target_ne = target_ne + self.apf_side_lock_sign * max(clearance_offset_m, float(getattr(self, 'obstacle_min_pc2_m', 0.16))) * route_normal_left_ne

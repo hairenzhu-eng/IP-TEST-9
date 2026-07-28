@@ -2302,9 +2302,8 @@ class _ControllerCore:
         if abs(lateral_speed) < self.apf_dynamic_speed_threshold_m_s:
             return 0.0
 
-        # Body y is positive to starboard/right.  The planner side sign is
-        # positive to port/left, so the astern side has the same sign here.
-        return float(np.sign(lateral_speed))
+        # Planner side is the obstacle's stern side: opposite its motion.
+        return float(-np.sign(lateral_speed))
 
     def own_prediction_velocity_ne(self):
         current_ne = np.array([float(self.North), float(self.East)], dtype=float)
@@ -3824,10 +3823,9 @@ class LaptopController(_OvertakingController):
             base_radius_m = min(pc1_m, pc2_m) * 0.5 + self.apf_own_equivalent_radius_m
             def field(position_ne, velocity_at_ne, pc1_at_m, pc2_at_m, heading_at_rad, bridge=False, prediction_dt_s=None, continuous_distance_m=None):
                 speed_at_m_s = float(np.linalg.norm(velocity_at_ne))
-                # pc1 axis: current obstacle heading + the heading predicted at this field point.
-                current_heading = float(track.get("heading_rad", 0.0))
-                axis_ne = np.array([np.cos(current_heading + heading_at_rad),
-                                    np.sin(current_heading + heading_at_rad)])
+                # pc1 axis follows the obstacle heading at this field point.
+                axis_ne = np.array([np.cos(heading_at_rad),
+                                    np.sin(heading_at_rad)])
                 return {
                     "label": -1000 - int(track.get("id", 0)), "virtual": True,
                     "bridge": bridge, "track_id": int(track.get("id", 0)),
@@ -4335,7 +4333,7 @@ class LaptopController(_OvertakingController):
         )
 
     def _ensure_apf_waypoint_path(self):
-        if not self._main_route_has_collision_risk() and not self._apf_waypoint_path_active():
+        if not self._main_route_has_collision_risk():
             self._clear_apf_waypoint_path()
             return False
         now_s = float(self.timefromstart) if self.timefromstart is not None else 0.0
@@ -4629,17 +4627,24 @@ class LaptopController(_OvertakingController):
             if not np.isfinite(heading_var) or heading_var > max_heading_var:
                 return obs_pos_body, obs_vel_body, False
 
-            state = np.asarray(track.get("state", [np.nan] * 4), dtype=float).reshape(4)
+            state = np.asarray(track.get("state", [np.nan] * 7), dtype=float).reshape(7)
             if not np.isfinite(state).all():
                 return obs_pos_body, obs_vel_body, False
             horizon_s = max(float(getattr(self, "apf_colreg_prediction_horizon_s", 1.0)), 0.0)
             accel_ne = self.obstacle_track_prediction_accel_ne(track)
             predicted_ne = state[:2] + state[2:4] * horizon_s + 0.5 * accel_ne * horizon_s ** 2
-            predicted_velocity_ne = state[2:4] + accel_ne * horizon_s
+            velocity_resultant_ne = state[2:4] + accel_ne * horizon_s
+            speed_m_s = float(np.linalg.norm(velocity_resultant_ne))
+            heading_unit_ne = np.array(
+                [np.cos(state[6]), np.sin(state[6])], dtype=float
+            )
+            if float(np.dot(heading_unit_ne, velocity_resultant_ne)) < 0.0:
+                heading_unit_ne = -heading_unit_ne
+            predicted_velocity_ne = speed_m_s * heading_unit_ne
             if (
                 not np.isfinite(predicted_ne).all()
                 or not np.isfinite(predicted_velocity_ne).all()
-                or np.linalg.norm(predicted_velocity_ne) < self.apf_dynamic_speed_threshold_m_s
+                or speed_m_s < self.apf_dynamic_speed_threshold_m_s
             ):
                 return obs_pos_body, obs_vel_body, False
             return (
@@ -4677,6 +4682,15 @@ class LaptopController(_OvertakingController):
             and 0.0 < tcpa_s <= self.apf_stand_on_emergency_tcpa_s
             and dcpa_m <= 2.0 * self.apf_own_equivalent_radius_m
         )
+        if "cross" in str(getattr(self, "webots_environment", "")).lower():
+            stern_side = self.apf_pass_astern_side_from_velocity(obs_vel_body)
+            if stern_side != 0.0:
+                encounter = (
+                    "crossing_from_starboard"
+                    if 0.0 <= bearing_deg < 180.0
+                    else "crossing_from_port"
+                )
+                return encounter, stern_side, "Crossing scene: pass astern"
         encounter = classify_colreg_zone(
             bearing_deg,
             relative_heading_deg,
@@ -4846,8 +4860,8 @@ class LaptopController(_OvertakingController):
     # crossing/overtaking/head_on dispatch location.
     def compute_apf_control(self, t, u_track):
         if not self.obstacle_ekf_prediction_enabled:
-            # EKF-off mode is local: no predicted-trajectory state may survive.
-            self._clear_apf_waypoint_path()
+            # EKF-off mode still needs measured crossing detours, including the
+            # stern waypoint; only predicted-trajectory state is unavailable.
             self.apf_side_lock_sign = 0.0
             self.apf_side_lock_active = False
             self.apf_colreg_active = False
@@ -4860,6 +4874,11 @@ class LaptopController(_OvertakingController):
             # attraction overwhelm the measured obstacle field.
             u_cmd = _CrossingController.compute_apf_control(self, t, u_track)
             self.apf_waypoint_speed_m_s = self._waypoint_speed_from_command(u_cmd)
+            if self._ensure_apf_waypoint_path():
+                tracking = self._compute_waypoint_tracking_control("apf_waypoint")
+                if tracking is not None:
+                    return tracking[2]
+            self._clear_apf_waypoint_path()
             return u_cmd
 
         selected_rule = self.select_colreg_strategy()
