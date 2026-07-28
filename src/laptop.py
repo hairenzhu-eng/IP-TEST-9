@@ -1883,8 +1883,9 @@ class _ControllerCore:
         obstacle["pc2_m"] = float(track.get("pc2_mean_m", track.get("pc2_m", self.obstacle_min_pc2_m)))
         obstacle["pc1_var_m2"] = float(track.get("pc1_var_m2", 0.0))
         obstacle["pc2_var_m2"] = float(track.get("pc2_var_m2", 0.0))
+        # Geometry uses the LiDAR PCA axis; heading/velocity remains telemetry.
         obstacle["length_axis_ne"] = np.asarray(
-            track.get("heading_axis_ne", track.get("length_axis_ne", [1.0, 0.0])),
+            track.get("length_axis_ne", [1.0, 0.0]),
             dtype=float,
         ).reshape(2).tolist()
         obstacle["equivalent_radius_m"] = float(track.get("equivalent_radius_m", self.obstacle_min_equivalent_radius_m))
@@ -3823,9 +3824,9 @@ class LaptopController(_OvertakingController):
             base_radius_m = min(pc1_m, pc2_m) * 0.5 + self.apf_own_equivalent_radius_m
             def field(position_ne, velocity_at_ne, pc1_at_m, pc2_at_m, heading_at_rad, bridge=False, prediction_dt_s=None, continuous_distance_m=None):
                 speed_at_m_s = float(np.linalg.norm(velocity_at_ne))
-                # pc1 axis follows the obstacle heading at this field point.
-                axis_ne = np.array([np.cos(heading_at_rad),
-                                    np.sin(heading_at_rad)])
+                # Keep the APF ellipse on the LiDAR PCA axis. The velocity
+                # direction is still used for the predicted centre trajectory.
+                axis_ne = self.obstacle_length_axis_ne(track)
                 return {
                     "label": -1000 - int(track.get("id", 0)), "virtual": True,
                     "bridge": bridge, "track_id": int(track.get("id", 0)),
@@ -4973,6 +4974,11 @@ class LaptopController(_OvertakingController):
                     "position_ne": item.get("centre_ne"),
                     "velocity_ne": item.get("velocity_ne"),
                     "heading_rad": item.get("heading_rad"),
+                    "length_axis_ne": item.get(
+                        "apf_ellipse_axis_ne",
+                        item.get("length_axis_ne"),
+                    ),
+                    "apf_ellipse_axis_ne": item.get("apf_ellipse_axis_ne"),
                     "pc1_m": item.get("pc1_m", item.get("apf_ellipse_pc1_m")),
                     "pc2_m": item.get("pc2_m", item.get("apf_ellipse_pc2_m")),
                     "prediction_dt_s": item.get("prediction_dt_s"),

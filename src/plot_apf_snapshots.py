@@ -749,16 +749,11 @@ def obstacle_ellipse_geometry(obstacle, settings):
 
 
 def track_length_axis(track, payload):
-    for key in ("apf_ellipse_axis_ne", "lidar_motion_axis_ne"):
+    # Use the axis written by the simulator/log, never recompute it from speed.
+    for key in ("length_axis_ne", "apf_ellipse_axis_ne", "lidar_motion_axis_ne"):
         axis = point(track.get(key))
         if axis is not None and float(np.linalg.norm(axis)) > 1e-9:
             return normalized_axis(axis)
-    velocity = velocity_vector(track)
-    if velocity is not None and float(np.linalg.norm(velocity)) > 1e-9:
-        return normalized_axis(velocity)
-    axis = point(track.get("length_axis_ne"))
-    if axis is not None:
-        return normalized_axis(axis)
     track_id = track.get("id")
     for cluster in payload.get("clusters", []):
         if not isinstance(cluster, dict) or cluster.get("track_id") != track_id:
@@ -766,8 +761,7 @@ def track_length_axis(track, payload):
         axis = point(cluster.get("length_axis_ne"))
         if axis is not None:
             return normalized_axis(axis)
-    heading = parse_float(track.get("heading_rad"))
-    return np.array([np.cos(heading), np.sin(heading)], dtype=float) if np.isfinite(heading) else np.array([1.0, 0.0])
+    return np.array([1.0, 0.0], dtype=float)
 
 
 def attractive_potential(north_grid, east_grid, target_ne, k_goal):
@@ -830,7 +824,9 @@ def ellipse_potential(
         own_radius_m = positive(settings.get("own_equivalent_radius_m"), 0.0)
         semi_length_m = max(0.5 * scale * pc1_m + own_radius_m, 1e-6)
         semi_width_m = max(0.5 * scale * pc2_m + own_radius_m, 1e-6)
-    axis = normalized_axis(obstacle.get("length_axis_ne"))
+    axis = normalized_axis(
+        obstacle.get("length_axis_ne", obstacle.get("apf_ellipse_axis_ne"))
+    )
     width_axis = np.array([-axis[1], axis[0]], dtype=float)
 
     along = delta_n * axis[0] + delta_e * axis[1]

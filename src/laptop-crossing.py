@@ -409,7 +409,8 @@ class LaptopController:
         obstacle['pc2_m'] = float(track.get('pc2_mean_m', track.get('pc2_m', self.obstacle_min_pc2_m)))
         obstacle['pc1_var_m2'] = float(track.get('pc1_var_m2', 0.0))
         obstacle['pc2_var_m2'] = float(track.get('pc2_var_m2', 0.0))
-        obstacle['length_axis_ne'] = np.asarray(track.get('heading_axis_ne', track.get('length_axis_ne', [1.0, 0.0])), dtype=float).reshape(2).tolist()
+        # Geometry uses the LiDAR PCA axis; heading/velocity remains telemetry.
+        obstacle['length_axis_ne'] = np.asarray(track.get('length_axis_ne', [1.0, 0.0]), dtype=float).reshape(2).tolist()
         obstacle['equivalent_radius_m'] = float(track.get('equivalent_radius_m', self.obstacle_min_equivalent_radius_m))
         obstacle['stats_sample_count'] = int(track.get('stats_sample_count', 0))
         obstacle['motion_stable'] = bool(track.get('motion_stable', False))
@@ -567,6 +568,10 @@ class LaptopController:
         return (pc1_m, pc2_m)
 
     def obstacle_length_axis_ne(self, obstacle):
+        axis_ne = np.asarray(obstacle.get('length_axis_ne', [np.nan, np.nan]), dtype=float).reshape(2)
+        axis_norm = float(np.linalg.norm(axis_ne))
+        if np.isfinite(axis_ne).all() and axis_norm >= 1e-06:
+            return axis_ne / axis_norm
         state = np.asarray(obstacle.get('state', []), dtype=float).reshape(-1)
         if state.size >= 4 and np.isfinite(state[:4]).all():
             velocity_ne = state[2:4]
@@ -616,7 +621,7 @@ class LaptopController:
             if tcpa_s <= 0.0:
                 continue
             pc1_m, pc2_m = self.obstacle_pc_dimensions(track)
-            ellipse_axis_ne = velocity_ne / max(float(np.linalg.norm(velocity_ne)), 1e-06)
+            ellipse_axis_ne = self.obstacle_length_axis_ne(track)
             collision_level, _ = ellipse_level_and_away(own_cpa_ne - obstacle_cpa_ne, ellipse_axis_ne, 0.5 * pc1_m + self.apf_own_equivalent_radius_m, 0.5 * pc2_m + self.apf_own_equivalent_radius_m)
             if collision_level >= float(self.apf_risk_pc_scale):
                 continue
