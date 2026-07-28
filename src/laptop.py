@@ -3713,31 +3713,21 @@ class LaptopController(_OvertakingController):
         return position_ne + velocity_ne * max(float(dt_s), 0.0), velocity_ne.copy()
 
     def obstacle_track_field_state_at(self, track, dt_s):
-        """Return heading-consistent position, velocity, size and heading at dt_s."""
+        """Return position, velocity, pc1, pc2 and predicted heading at dt_s."""
         raw_state = np.asarray(track.get("state", [np.nan] * 7), dtype=float).reshape(-1)
         if raw_state.size < 7 or not np.isfinite(raw_state[:6]).all():
             return None
+        position_ne, velocity_ne = self.obstacle_track_state_at(track, dt_s)
+        if position_ne is None or velocity_ne is None:
+            return None
         accel_ne = self.obstacle_track_prediction_accel_ne(track)
         dt_s = max(float(dt_s), 0.0)
-        raw_velocity_ne = raw_state[2:4]
-        speed_m_s = float(np.linalg.norm(raw_velocity_ne))
-        heading_rad = float(raw_state[6]) if np.isfinite(raw_state[6]) else np.nan
-        if not np.isfinite(heading_rad):
-            heading_rad = float(np.arctan2(raw_velocity_ne[1], raw_velocity_ne[0]))
-        heading_axis_ne = np.array([np.cos(heading_rad), np.sin(heading_rad)], dtype=float)
-        if speed_m_s >= 1e-6 and float(np.dot(heading_axis_ne, raw_velocity_ne)) < 0.0:
-            heading_axis_ne = -heading_axis_ne
-            heading_rad = float(np.arctan2(heading_axis_ne[1], heading_axis_ne[0]))
-
-        longitudinal_accel_m_s2 = float(np.dot(accel_ne, heading_axis_ne))
-        distance_m = max(
-            speed_m_s * dt_s + 0.5 * longitudinal_accel_m_s2 * dt_s * dt_s,
-            0.0,
-        )
-        position_ne = raw_state[:2] + heading_axis_ne * distance_m
-        velocity_ne = heading_axis_ne * max(
-            speed_m_s + longitudinal_accel_m_s2 * dt_s,
-            0.0,
+        velocity_ne = velocity_ne + accel_ne * dt_s
+        speed_m_s = float(np.linalg.norm(velocity_ne))
+        heading_rad = (
+            float(np.arctan2(velocity_ne[1], velocity_ne[0]))
+            if speed_m_s >= 1e-6
+            else float(raw_state[6])
         )
         return position_ne, velocity_ne, max(float(raw_state[4]), self.obstacle_min_pc1_m), max(float(raw_state[5]), self.obstacle_min_pc2_m), heading_rad
 
@@ -3761,11 +3751,7 @@ class LaptopController(_OvertakingController):
                 continue
             # The first point is the current LiDAR cluster, not the EKF state
             # (the latter may already be one frame ahead of the measurement).
-            field_state = self.obstacle_track_field_state_at(track, 0.0)
-            if field_state is None:
-                continue
-            _, velocity_ne, _, _, _ = field_state
-            start_ne = np.asarray(track.get("pos_ne", [np.nan, np.nan]), dtype=float).reshape(2)
+            start_ne, velocity_ne = self.obstacle_track_state_at(track, 0.0)
             for detected in self.lidar_obstacles:
                 if int(detected.get("track_id", -1)) == int(track.get("id", -2)):
                     start_ne = np.asarray(detected.get("centre_ne", start_ne), dtype=float)
@@ -4614,11 +4600,16 @@ class LaptopController(_OvertakingController):
             if not np.isfinite(state).all():
                 return obs_pos_body, obs_vel_body, False
             horizon_s = max(float(getattr(self, "apf_colreg_prediction_horizon_s", 1.0)), 0.0)
-            field_state = self.obstacle_track_field_state_at(track, horizon_s)
-            if field_state is None:
-                return obs_pos_body, obs_vel_body, False
-            predicted_ne, predicted_velocity_ne, _, _, _ = field_state
-            speed_m_s = float(np.linalg.norm(predicted_velocity_ne))
+            accel_ne = self.obstacle_track_prediction_accel_ne(track)
+            predicted_ne = state[:2] + state[2:4] * horizon_s + 0.5 * accel_ne * horizon_s ** 2
+            velocity_resultant_ne = state[2:4] + accel_ne * horizon_s
+            speed_m_s = float(np.linalg.norm(velocity_resultant_ne))
+            heading_unit_ne = np.array(
+                [np.cos(state[6]), np.sin(state[6])], dtype=float
+            )
+            if float(np.dot(heading_unit_ne, velocity_resultant_ne)) < 0.0:
+                heading_unit_ne = -heading_unit_ne
+            predicted_velocity_ne = speed_m_s * heading_unit_ne
             if (
                 not np.isfinite(predicted_ne).all()
                 or not np.isfinite(predicted_velocity_ne).all()
