@@ -621,7 +621,7 @@ class LaptopController:
             if tcpa_s <= 0.0:
                 continue
             pc1_m, pc2_m = self.obstacle_pc_dimensions(track)
-            ellipse_axis_ne = self.obstacle_length_axis_ne(track)
+            ellipse_axis_ne = velocity_ne / max(float(np.linalg.norm(velocity_ne)), 1e-06)
             collision_level, _ = ellipse_level_and_away(own_cpa_ne - obstacle_cpa_ne, ellipse_axis_ne, 0.5 * pc1_m + self.apf_own_equivalent_radius_m, 0.5 * pc2_m + self.apf_own_equivalent_radius_m)
             if collision_level >= float(self.apf_risk_pc_scale):
                 continue

@@ -395,7 +395,9 @@ class LaptopController:
         obstacle['pc2_m'] = float(track.get('pc2_mean_m', track.get('pc2_m', self.obstacle_min_pc2_m)))
         obstacle['pc1_var_m2'] = float(track.get('pc1_var_m2', 0.0))
         obstacle['pc2_var_m2'] = float(track.get('pc2_var_m2', 0.0))
-        obstacle['length_axis_ne'] = np.asarray(track.get('heading_axis_ne', track.get('length_axis_ne', [1.0, 0.0])), dtype=float).reshape(2).tolist()
+        # Keep measured obstacle geometry on LiDAR PC1; EKF heading is
+        # carried separately for predicted-field orientation.
+        obstacle['length_axis_ne'] = np.asarray(track.get('length_axis_ne', [1.0, 0.0]), dtype=float).reshape(2).tolist()
         obstacle['equivalent_radius_m'] = float(track.get('equivalent_radius_m', self.obstacle_min_equivalent_radius_m))
         obstacle['stats_sample_count'] = int(track.get('stats_sample_count', 0))
         obstacle['motion_stable'] = bool(track.get('motion_stable', False))

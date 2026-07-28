@@ -2680,32 +2680,6 @@ class _ControllerCore:
                         self.apf_direction_clearance_m(obstacle, params=obstacle_params),
                     )
 
-        if any_repulsion and self.apf_side_lock_sign != 0.0:
-            # side_sign uses the COLREG convention used throughout this
-            # controller: +1 is port/left and -1 is starboard/right.
-            route_normal_left_ne = np.array(
-                [self.route_path_unit_ne[1], -self.route_path_unit_ne[0]],
-                dtype=float,
-            )
-            offset_target_ne = (
-                target_ne
-                + self.apf_side_lock_sign
-                * max(clearance_offset_m, self.obstacle_min_pc2_m)
-                * route_normal_left_ne
-            )
-            offset_target_body = self.earth_point_to_body(offset_target_ne)
-            offset_distance = float(np.linalg.norm(offset_target_body))
-            if offset_distance > 1e-6:
-                offset_force = (
-                    self.apf_clearance_gain
-                    * min(offset_distance, self.apf_attraction_saturation_m)
-                    * offset_target_body
-                    / offset_distance
-                )
-                force_body += offset_force
-                attractive_force += offset_force
-                self.apf_target_ne = offset_target_ne.copy()
-
         self.apf_attractive_force_body = attractive_force
         force_norm = float(np.linalg.norm(force_body))
         if not np.isfinite(force_norm) or force_norm < 1e-6:
@@ -2718,17 +2692,7 @@ class _ControllerCore:
         if any_repulsion and steering_force[0] <= 0.0:
             side_sign = float(np.sign(steering_force[1]))
 
-            if side_sign == 0.0:
-                side_sign = self.apf_side_lock_sign
-
-            if side_sign == 0.0:
-                if self.left_clearance_m > self.right_clearance_m + 0.05:
-                    side_sign = 1.0
-                else:
-                    side_sign = -1.0
-
             lateral_mag = max(abs(float(steering_force[1])), 0.5 * abs(float(force_body[0])), 0.20)
-            steering_force[1] = side_sign * lateral_mag
             steering_force[0] = max(0.25 * lateral_mag, 0.05)
 
         self.apf_steering_force_body = steering_force
@@ -2740,13 +2704,6 @@ class _ControllerCore:
         surge_speed = float(
             active_params.get("constant_descent_speed_m_s", self.apf_constant_descent_speed_m_s)
         )
-        force_angle, surge_speed = self.apf_overtaking_close_turn_command(
-            primary_encounter,
-            nearest_obstacle_distance_m,
-            force_angle,
-            surge_speed,
-        )
-
         u_cmd = Vector(2)
         u_cmd[1, 0] = np.clip(-self.apf_heading_gain * force_angle / max(self.lastdt, 1e-3), -self.w_max, self.w_max)
         u_cmd[0, 0] = float(np.clip(surge_speed, 0.0, self.v_max))
@@ -3555,7 +3512,8 @@ class LaptopController(_OvertakingController):
         # Match the strategy controllers so position noise near the goal does
         # not keep the vessel circling a point it has effectively reached.
         self.goal_tolerance_m = 0.20
-        self.apf_waypoint_detour_enabled = True
+        # The APF force is the sole avoidance path generator.
+        self.apf_waypoint_detour_enabled = False
         self.apf_waypoint_acceptance_m = 0.45 if self.OPERATING_MODE == 2 else 0.30
         self.apf_waypoint_replan_interval_s = 0.2 if self.OPERATING_MODE == 2 else 0.8
         self.apf_waypoint_entry_margin_m = max(
@@ -3812,6 +3770,8 @@ class LaptopController(_OvertakingController):
                 continue
 
             pc1_m, pc2_m = self.obstacle_pc_dimensions(track)
+            # The terminal virtual field is the obstacle position at 2x-TCPA,
+            # extrapolated along its EKF motion line.
             final_ne = start_ne + velocity_ne * (2.0 * tcpa_s)
             continuous_line_distance_m = float(np.linalg.norm(final_ne - start_ne))
             self.apf_continuous_field_distance_m[int(track.get("id", 0))] = continuous_line_distance_m
@@ -3824,9 +3784,17 @@ class LaptopController(_OvertakingController):
             base_radius_m = min(pc1_m, pc2_m) * 0.5 + self.apf_own_equivalent_radius_m
             def field(position_ne, velocity_at_ne, pc1_at_m, pc2_at_m, heading_at_rad, bridge=False, prediction_dt_s=None, continuous_distance_m=None):
                 speed_at_m_s = float(np.linalg.norm(velocity_at_ne))
-                # Keep the APF ellipse on the LiDAR PCA axis. The velocity
-                # direction is still used for the predicted centre trajectory.
-                axis_ne = self.obstacle_length_axis_ne(track)
+                # Real field geometry uses PC1; predicted fields follow the
+                # EKF heading at their own predicted time.
+                axis_ne = np.array([
+                    np.cos(heading_at_rad),
+                    np.sin(heading_at_rad),
+                ], dtype=float)
+                axis_norm = float(np.linalg.norm(axis_ne))
+                if not np.isfinite(axis_ne).all() or axis_norm < 1e-6:
+                    axis_ne = self.obstacle_length_axis_ne(track)
+                else:
+                    axis_ne /= axis_norm
                 return {
                     "label": -1000 - int(track.get("id", 0)), "virtual": True,
                     "bridge": bridge, "track_id": int(track.get("id", 0)),
@@ -3878,10 +3846,20 @@ class LaptopController(_OvertakingController):
                 elapsed_s += dt_s
                 previous_pc1_m = predicted_pc1_m
                 previous_speed_m_s = float(np.linalg.norm(predicted_vel))
-            # Keep the 2*TCPA virtual field unchanged.
-            self.apf_virtual_obstacles.append(field(final_ne, velocity_ne, pc1_m, pc2_m,
-                                                    float(np.arctan2(velocity_ne[1], velocity_ne[0])),
-                                                    prediction_dt_s=2.0 * tcpa_s))
+            terminal_state = self.obstacle_track_field_state_at(track, 2.0 * tcpa_s)
+            terminal_heading_rad = (
+                terminal_state[4]
+                if terminal_state is not None
+                else float(np.arctan2(velocity_ne[1], velocity_ne[0]))
+            )
+            self.apf_virtual_obstacles.append(field(
+                final_ne,
+                velocity_ne,
+                pc1_m,
+                pc2_m,
+                terminal_heading_rad,
+                prediction_dt_s=2.0 * tcpa_s,
+            ))
         return self.apf_virtual_obstacles
 
     def _route_normal_left_ne(self):
@@ -4296,19 +4274,6 @@ class LaptopController(_OvertakingController):
                 + side_sign * lateral_offset_m * route_normal_left_ne
                 + force_bias_m * blend_dir_ne
             )
-        if self.apf_encounter_mode in self._CROSSING_RULES and candidates:
-            stern_candidates = [obstacle for obstacle in candidates if obstacle["virtual"]] or candidates
-            obstacle = min(stern_candidates, key=lambda item: item["along_m"])
-            stern_ne = obstacle_stern_waypoint(
-                obstacle["centre_ne"],
-                obstacle["velocity_ne"],
-                obstacle["field_long_m"] + self.apf_waypoint_lateral_margin_m,
-            )
-            if stern_ne is not None:
-                candidate_points.append(stern_ne)
-                candidate_points.sort(
-                    key=lambda point: float(np.dot(point - self.start_ne, self.route_path_unit_ne))
-                )
         candidate_points.append(self._point_on_main_route(merge_along_m))
         resume_along_m = min(
             merge_along_m + waypoint_step_m,
@@ -4334,6 +4299,9 @@ class LaptopController(_OvertakingController):
         )
 
     def _ensure_apf_waypoint_path(self):
+        if not self.apf_waypoint_detour_enabled:
+            self._clear_apf_waypoint_path()
+            return False
         if not self._main_route_has_collision_risk():
             self._clear_apf_waypoint_path()
             return False
@@ -4915,6 +4883,9 @@ class LaptopController(_OvertakingController):
         return risk_active
 
     def compute_route_tracking_control(self, t):
+        if not self.apf_waypoint_detour_enabled:
+            self._clear_apf_waypoint_path()
+            return _OvertakingController.compute_route_tracking_control(self, t)
         # This method runs before the APF branch in the live control loop.
         # Refresh here as well, otherwise an active detour is only replanned
         # on frames where APF happens to be selected.
@@ -5012,8 +4983,9 @@ class LaptopController(_OvertakingController):
             if virtual_obstacles:
                 apf["tcpa_s"] = float(closest["tcpa_s"])
                 apf["dcpa_m"] = float(closest["dcpa_m"])
-                apf["dcpa_position_ne"] = closest["centre_ne"]
+                apf["dcpa_position_ne"] = closest["collision_position_ne"]
                 apf["obstacle_dcpa_position_ne"] = closest["obstacle_dcpa_position_ne"]
+                apf["obstacle_tcpa_position_ne"] = closest["centre_ne"]
                 apf["obstacle_min_separation_point_ne"] = closest["obstacle_min_separation_point_ne"]
                 apf["obstacle_ekf_prediction_velocity_ne"] = closest["velocity_ne"]
                 apf["obstacle_ekf_prediction_heading_rad"] = closest["heading_rad"]
